@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+
+# Storage (generated at runtime)
+backend/storage/uploads/*
+backend/storage/reports/*
+backend/storage/figures/*
+backend/storage/models/*
+!backend/storage/**/.gitkeep
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS / Editors
+.DS_Store
+.idea/
+.vscode/
+*.log
+# Storage (Ignore all generated files and user data)
+backend/storage/**
+!backend/storage/figures/.gitkeep
+!backend/storage/models/.gitkeep
+!backend/storage/reports/.gitkeep
+!backend/storage/uploads/.gitkeep
