@@ -58,6 +58,7 @@ class Settings(BaseSettings):
 
     # ---------- App Settings ----------
     APP_NAME: str = "AutoML Agent"
+    ENVIRONMENT: str = "development"
     APP_BASE_URL: str = "http://localhost:8100"
     FRONTEND_URL: str = "http://localhost:5173"
 
@@ -88,4 +89,19 @@ class Settings(BaseSettings):
             directory.mkdir(parents=True, exist_ok=True)
 
 settings = Settings()
+
+
+def validate_security_settings(config: Settings) -> None:
+    """Fail fast when production is configured with an unsafe JWT secret."""
+    if config.ENVIRONMENT.strip().lower() != "production":
+        return
+    secret_key = config.SECRET_KEY.strip()
+    if secret_key == "CHANGE_ME" or len(secret_key) < 32:
+        raise RuntimeError(
+            "SECRET_KEY must be at least 32 characters and must not be "
+            "'CHANGE_ME' when ENVIRONMENT=production."
+        )
+
+
+validate_security_settings(settings)
 settings.ensure_dirs()

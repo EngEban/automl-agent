@@ -130,3 +130,54 @@ def list_artifacts(db: DBSession, session_id: str) -> list[Artifact]:
         .order_by(Artifact.created_at.asc())
     )
     return list(db.scalars(stmt))
+
+# ---------- AnalysisRun ----------
+from app.db.models import AnalysisRun, RunEvent
+
+def create_run(db: DBSession, **kwargs) -> AnalysisRun:
+    obj = AnalysisRun(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def get_run(db: DBSession, run_id: str) -> Optional[AnalysisRun]:
+    try:
+        return db.get(AnalysisRun, run_id)
+    except Exception:
+        return None
+
+def update_run(db: DBSession, run_id: str, **updates) -> Optional[AnalysisRun]:
+    obj = db.get(AnalysisRun, run_id)
+    if obj is None:
+        return None
+    for key, value in updates.items():
+        setattr(obj, key, value)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def list_runs_for_session(db: DBSession, session_id: str) -> list[AnalysisRun]:
+    stmt = (
+        select(AnalysisRun)
+        .where(AnalysisRun.session_id == session_id)
+        .order_by(AnalysisRun.created_at.desc())
+    )
+    return list(db.scalars(stmt))
+
+# ---------- RunEvent ----------
+def create_event(db: DBSession, **kwargs) -> RunEvent:
+    obj = RunEvent(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def list_events_for_run(db: DBSession, run_id: str, limit: int = 100) -> list[RunEvent]:
+    stmt = (
+        select(RunEvent)
+        .where(RunEvent.run_id == run_id)
+        .order_by(RunEvent.created_at.asc())
+        .limit(limit)
+    )
+    return list(db.scalars(stmt))

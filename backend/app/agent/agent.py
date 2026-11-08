@@ -1,9 +1,5 @@
 """
 The agent loop: alternate between LLM decisions and tool execution.
-
-Tool failures are terminal for the current user turn.  They are persisted as a
-normal assistant response and are never sent back to the LLM for an automatic
-retry, which prevents repeated destructive or expensive pipeline attempts.
 """
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ import logging
 from typing import Any
 
 from sqlalchemy.orm import Session as DBSession
+from starlette.concurrency import run_in_threadpool
 
 from app.agent.executor import execute_tool
 from app.agent.llm import chat, extract_message
@@ -20,6 +17,7 @@ from app.agent.prompts import build_system_prompt
 from app.agent.tools import get_tool_schemas
 from app.config import settings
 from app.db.crud import create_message
+from app.services.run_service import emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +49,11 @@ async def run_agent(
     session_id: str,
     user_message: str,
     db: DBSession,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Run one agent turn and persist the complete user/assistant/tool transcript.
-
-    Returns ``content``, all model-requested ``tool_calls``, and the number of
-    LLM iterations used.  A tool error consumes the current turn immediately.
+    Emits progress events if run_id is provided.
     """
     create_message(db, session_id=session_id, role="user", content=user_message)
 
@@ -70,6 +67,7 @@ async def run_agent(
     final_content = ""
     iterations = 0
     terminated_on_error = False
+    tool_call_history: list[str] = []
 
     for iteration in range(1, settings.AGENT_MAX_ITERATIONS + 1):
         iterations = iteration
@@ -78,6 +76,15 @@ async def run_agent(
             iteration,
             settings.AGENT_MAX_ITERATIONS,
         )
+
+        if run_id:
+            progress = min(85, 10 + (iteration * 10))
+            emit_event(
+                db, run_id, "step.progress", 
+                step="thinking", 
+                progress=progress, 
+                message=f"Agent reasoning (iteration {iteration})..."
+            )
 
         response = await chat(messages=messages, tools=tools)
         model_message = extract_message(response)
@@ -95,8 +102,6 @@ async def run_agent(
             )
             break
 
-        # The normaliser guarantees JSON-string arguments before this is
-        # persisted or appended to the next LiteLLM request.
         all_tool_calls.extend(tool_calls)
         create_message(
             db,
@@ -116,23 +121,40 @@ async def run_agent(
             tool_name = str(function.get("name") or "")
             tool_call_id = str(tool_call.get("id") or "")
 
+            # Loop breaker
+            tool_call_history.append(tool_name)
+            if len(tool_call_history) >= 3 and tool_call_history[-1] == tool_call_history[-2] == tool_call_history[-3]:
+                final_content = f"I stopped because I was stuck in a loop trying to run '{tool_name}'."
+                terminated_on_error = True
+                break
+
+            if run_id:
+                emit_event(
+                    db, run_id, "step.started", 
+                    step=tool_name, 
+                    progress=50, 
+                    message=f"Executing tool: {tool_name}"
+                )
+
             try:
                 arguments = _parse_tool_arguments(function.get("arguments"))
+                logger.info("Executing tool: %s(%s)", tool_name, arguments)
+                
+                # Run tool in threadpool to avoid Playwright sync/async clash
+                result = await run_in_threadpool(execute_tool, session_id, tool_name, arguments, db)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 result = _error_result(
                     tool_name,
                     f"Invalid arguments for '{tool_name}': {exc}",
                     type(exc).__name__,
                 )
-            else:
-                logger.info("Executing tool: %s(%s)", tool_name, arguments)
-                result = execute_tool(session_id, tool_name, arguments, db)
-                if not isinstance(result, dict):
-                    result = _error_result(
-                        tool_name,
-                        "Tool returned a non-dictionary result.",
-                        "TypeError",
-                    )
+
+            if not isinstance(result, dict):
+                result = _error_result(
+                    tool_name,
+                    "Tool returned a non-dictionary result.",
+                    "TypeError",
+                )
 
             result_str = format_tool_result(tool_name, result)
             create_message(
@@ -151,38 +173,28 @@ async def run_agent(
                 "content": result_str,
             })
 
-            # Treat both the explicit error key and ok=False as terminal.  In
-            # particular, do not append the result and make another LLM call.
             if "error" in result or result.get("ok") is False:
-                error = str(
-                    result.get("error")
-                    or "The tool failed without an error message."
-                )
+                error = str(result.get("error") or "The tool failed without an error message.")
                 final_content = f"Tool '{tool_name}' failed: {error}"
                 logger.error(final_content)
                 messages.append({"role": "assistant", "content": final_content})
-                create_message(
-                    db,
-                    session_id=session_id,
-                    role="assistant",
-                    content=final_content,
-                )
+                create_message(db, session_id=session_id, role="assistant", content=final_content)
                 terminated_on_error = True
                 break
 
         if terminated_on_error:
             break
     else:
-        final_content = (
-            "I reached the maximum number of steps without finishing. "
-            "Please refine the request and try again."
-        )
+        final_content = "I reached the maximum number of steps without finishing. Please refine the request and try again."
         logger.warning(final_content)
-        create_message(
-            db,
-            session_id=session_id,
-            role="assistant",
-            content=final_content,
+        create_message(db, session_id=session_id, role="assistant", content=final_content)
+
+    if run_id:
+        emit_event(
+            db, run_id, "step.completed", 
+            step="chat", 
+            progress=100, 
+            message="Analysis finished."
         )
 
     return {

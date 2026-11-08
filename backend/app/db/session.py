@@ -3,14 +3,10 @@ SQLAlchemy engine and session factory.
 """
 from __future__ import annotations
 
-import logging
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 engine = create_engine(
     settings.DATABASE_URL,
@@ -35,15 +31,3 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def init_db() -> None:
-    """
-    Create all tables. Idempotent (CREATE TABLE IF NOT EXISTS).
-    Raises if the database is unreachable — caller decides how to handle it.
-    """
-    from app.db.base import Base
-    from app.db import models  # noqa: F401 - register models in metadata
-
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables ensured.")

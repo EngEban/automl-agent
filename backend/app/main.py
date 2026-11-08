@@ -3,9 +3,6 @@ FastAPI application entry point.
 """
 from __future__ import annotations
 
-import logging
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,26 +12,12 @@ from app.utils.logging import configure_logging
 
 
 configure_logging()
-logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup/shutdown hooks."""
-    try:
-        from app.db.session import init_db
-        init_db()
-        logger.info("Database ready.")
-    except Exception as exc:
-        logger.warning("DB init skipped (start PostgreSQL and retry): %s", exc)
-    yield
 
 
 app = FastAPI(
     title="AutoML Agent API",
     description="Automated data analysis with an AI agent + English PDF reports",
     version="0.2.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(

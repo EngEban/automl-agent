@@ -27,12 +27,13 @@ class User(Base):
     google_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     
-    # حقل جديد لإشعارات المتصفح (Web Push)
+    # حقل إشعارات المتصفح (Web Push)
     push_subscription: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     sessions: Mapped[list["Session"]] = relationship("Session", back_populates="user", cascade="all, delete-orphan")
+    analysis_runs: Mapped[list["AnalysisRun"]] = relationship("AnalysisRun", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<User email={self.email!r}>"
@@ -57,6 +58,7 @@ class Session(Base):
     messages: Mapped[list["Message"]] = relationship("Message", back_populates="session", cascade="all, delete-orphan")
     operations: Mapped[list["Operation"]] = relationship("Operation", back_populates="session", cascade="all, delete-orphan")
     artifacts: Mapped[list["Artifact"]] = relationship("Artifact", back_populates="session", cascade="all, delete-orphan")
+    analysis_runs: Mapped[list["AnalysisRun"]] = relationship("AnalysisRun", back_populates="session", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Session id={self.id} name={self.name!r} status={self.status}>"
@@ -94,3 +96,61 @@ class Artifact(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     session: Mapped["Session"] = relationship("Session", back_populates="artifacts")
+
+# ==========================================
+# NEW MODELS FOR ASYNCHRONOUS JOB LIFECYCLE
+# ==========================================
+
+class AnalysisRun(Base):
+    __tablename__ = "analysis_runs"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    requested_by: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    
+    # Status: queued, running, awaiting_approval, succeeded, failed, cancelled
+    status: Mapped[str] = mapped_column(String(50), default="queued", nullable=False, index=True)
+    current_step: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    progress_percent: Mapped[int] = mapped_column(default=0, nullable=False)
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    session: Mapped["Session"] = relationship("Session", back_populates="analysis_runs")
+    user: Mapped["User"] = relationship("User", back_populates="analysis_runs")
+    events: Mapped[list["RunEvent"]] = relationship("RunEvent", back_populates="run", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return f"<AnalysisRun id={self.id} status={self.status}>"
+
+
+class RunEvent(Base):
+    __tablename__ = "run_events"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("analysis_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    # event_type: run.started, step.started, step.progress, run.succeeded, run.failed, run.cancelled
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    step: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    progress_percent: Mapped[int] = mapped_column(default=0, nullable=False)
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    run: Mapped["AnalysisRun"] = relationship("AnalysisRun", back_populates="events")
+
+    def __repr__(self) -> str:
+        return f"<RunEvent id={self.id} type={self.event_type}>"

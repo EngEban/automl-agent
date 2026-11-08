@@ -5,10 +5,12 @@ Supports local files (CSV, JSON, Excel) and direct URLs.
 from __future__ import annotations
 
 import io
+import ipaddress
 import logging
+import socket
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -18,6 +20,13 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".json", ".jsonl", ".xlsx", ".xls"}
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+MAX_REDIRECTS = 5
+BLOCKED_HOSTNAMES = {
+    "localhost",
+    "metadata.google.internal",
+    "metadata.google.internal.",
+}
 
 
 class DataLoadError(Exception):
@@ -98,23 +107,130 @@ def load_from_bytes(content: bytes, filename: str) -> pd.DataFrame:
 
 
 def load_from_url(url: str) -> pd.DataFrame:
-    """Load a DataFrame from a direct URL."""
-    if not url.startswith(("http://", "https://")):
-        raise DataLoadError("URL must start with http:// or https://")
+    """Load a DataFrame from a URL after SSRF and size checks."""
+    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    current_url = url
+    content = bytearray()
+
+    for redirect_number in range(MAX_REDIRECTS + 1):
+        _validate_remote_url(current_url)
+        response = None
+        try:
+            # Redirects are handled manually so every destination is checked.
+            response = requests.get(
+                current_url,
+                timeout=60,
+                stream=True,
+                allow_redirects=False,
+            )
+
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = (
+                    response.headers.get("Location")
+                    or response.headers.get("location")
+                )
+                if not location:
+                    raise DataLoadError("URL redirect did not provide a destination.")
+                if redirect_number >= MAX_REDIRECTS:
+                    raise DataLoadError("Too many URL redirects.")
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+            content_length = (
+                response.headers.get("Content-Length")
+                or response.headers.get("content-length")
+            )
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise DataLoadError(
+                            f"File exceeds {settings.MAX_FILE_SIZE_MB} MB."
+                        )
+                except ValueError:
+                    logger.warning("Ignoring invalid Content-Length header from %s", current_url)
+
+            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if not chunk:
+                    continue
+                content.extend(chunk)
+                if len(content) > max_bytes:
+                    raise DataLoadError(
+                        f"File exceeds {settings.MAX_FILE_SIZE_MB} MB."
+                    )
+            break
+        except DataLoadError:
+            raise
+        except requests.RequestException as exc:
+            raise DataLoadError(f"Failed to download URL: {exc}") from exc
+        finally:
+            if response is not None:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+
+    fmt = _detect_format(current_url)
+    df = _read_bytes(bytes(content), fmt)
+    return _post_process(df, source=url)
+
+
+def _validate_remote_url(url: str) -> None:
+    """Reject non-web URLs and destinations that resolve to local networks."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise DataLoadError("URL must use http:// or https://")
+    if not parsed.hostname:
+        raise DataLoadError("URL must include a hostname.")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in BLOCKED_HOSTNAMES or hostname.endswith(".localhost"):
+        raise DataLoadError("URL hostname is not allowed.")
 
     try:
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise DataLoadError(f"Failed to download URL: {exc}") from exc
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise DataLoadError("URL contains an invalid port.") from exc
 
-    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
-    if len(resp.content) > max_bytes:
-        raise DataLoadError(f"File exceeds {settings.MAX_FILE_SIZE_MB} MB.")
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise DataLoadError(f"Could not resolve URL hostname: {hostname}") from exc
 
-    fmt = _detect_format(url)
-    df = _read_bytes(resp.content, fmt)
-    return _post_process(df, source=url)
+    resolved_ips = {
+        ipaddress.ip_address(result[4][0])
+        for result in addresses
+        if result[4]
+    }
+    if not resolved_ips:
+        raise DataLoadError("URL hostname did not resolve to an address.")
+
+    blocked_ip = next(
+        (address for address in resolved_ips if _is_blocked_ip(address)),
+        None,
+    )
+    if blocked_ip is not None:
+        raise DataLoadError(f"URL resolves to a blocked address: {blocked_ip}")
+
+
+def _is_blocked_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return whether an address is local, private, link-local, or special-use."""
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    metadata_ip = ipaddress.ip_address("169.254.169.254")
+    return (
+        address == metadata_ip
+        or address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_unspecified
+        or address.is_multicast
+    )
 
 
 def load_from_path(path: str | Path) -> pd.DataFrame:

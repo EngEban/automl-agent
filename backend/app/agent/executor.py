@@ -123,8 +123,26 @@ def _tool_get_session_status(session_id: str, args: dict, db: DBSession) -> dict
 
 def _tool_inspect_dataset(session_id: str, args: dict, db: DBSession) -> dict:
     df = _load_raw(db, session_id)
-    info = describe(df)
-    info["sample_rows"] = df.head(5).to_dict(orient="records")
+    # Dataset values are private by default. The LLM receives structural
+    # metadata unless the caller explicitly opts in to sample rows.
+    info = {
+        "schema": {
+            "n_rows": int(df.shape[0]),
+            "n_columns": int(df.shape[1]),
+            "columns": [str(column) for column in df.columns],
+        },
+        "dtypes": {str(column): str(dtype) for column, dtype in df.dtypes.items()},
+        "missing_counts": {
+            str(column): int(count)
+            for column, count in df.isna().sum().items()
+        },
+        "unique_counts": {
+            str(column): int(df[column].nunique(dropna=True))
+            for column in df.columns
+        },
+    }
+    if args.get("include_sample_rows") is True:
+        info["sample_rows"] = df.head(5).to_dict(orient="records")
     return info
 
 

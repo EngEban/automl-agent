@@ -1,5 +1,5 @@
 """
-English PDF report generator using WeasyPrint + Jinja2.
+English PDF report generator using Playwright + Jinja2.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, select_autoescape
-from weasyprint import HTML
+from playwright.sync_api import sync_playwright
 
 from app.config import settings
 
@@ -157,7 +157,7 @@ def generate_report(
     task_type: str,
     target_column: str,
 ) -> Path:
-    """Generate a PDF report, tolerating incomplete optional report data."""
+    """Generate a PDF report using Playwright."""
     data = _normalize_data(data)
     training = _normalize_training(training)
     operations = _normalize_operations(operations)
@@ -169,15 +169,18 @@ def generate_report(
     readiness = readiness if isinstance(readiness, dict) else {}
     figures = eda.get("figures")
     figures = figures if isinstance(figures, dict) else {}
+    
+    # تصفية الصور الصالحة فقط
     figures = {
         str(name): value
         for name, value in figures.items()
         if _is_png_base64(value)
     }
 
-    recs = _recommendations(data, training, task_type)
+    recommendations = _recommendations(data, training, task_type)
     environment = Environment(autoescape=select_autoescape(["html", "xml"]))
     environment.filters["number"] = _format_number
+    
     html = environment.from_string(HTML_TEMPLATE).render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         data=data,
@@ -187,19 +190,30 @@ def generate_report(
         figures=figures,
         operations=operations,
         training=training,
-        recommendations=recs,
+        recommendations=recommendations,
     )
 
-    out = settings.REPORT_DIR / f"{task_id}.pdf"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    HTML(string=html).write_pdf(str(out))
+    output_path = settings.REPORT_DIR / f"{task_id}.pdf"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Report saved: %s", out)
-    return out
+    # استخدام Playwright لتوليد الـ PDF
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.set_content(html, wait_until="networkidle")
+        page.pdf(
+            path=str(output_path),
+            format="A4",
+            margin={"top": "1.5cm", "bottom": "1.5cm", "left": "1.5cm", "right": "1.5cm"},
+            print_background=True
+        )
+        browser.close()
+
+    logger.info("Report saved: %s", output_path)
+    return output_path
 
 
 def _normalize_data(data: Any) -> dict[str, Any]:
-    """Provide template-safe defaults for missing or malformed data summaries."""
     result = dict(data) if isinstance(data, dict) else {}
     result.setdefault("n_rows", 0)
     result.setdefault("n_columns", 0)
@@ -208,7 +222,7 @@ def _normalize_data(data: Any) -> dict[str, Any]:
     result.setdefault("duplicate_rows", 0)
     result.setdefault("numeric_columns", [])
     result.setdefault("categorical_columns", [])
-
+    
     if not isinstance(result["columns"], (list, tuple)):
         result["columns"] = []
     else:
@@ -228,12 +242,11 @@ def _normalize_data(data: Any) -> dict[str, Any]:
 
 
 def _normalize_training(training: Any) -> dict[str, Any]:
-    """Normalize metrics so malformed or partial results still render clearly."""
     result = dict(training) if isinstance(training, dict) else {}
     result.setdefault("best_model_name", "Unavailable")
     result.setdefault("best_score", None)
     result.setdefault("metric", "Metric")
-
+    
     metric_names = result.get("metric_names")
     if not isinstance(metric_names, (list, tuple)):
         metric_names = []
@@ -242,6 +255,7 @@ def _normalize_training(training: Any) -> dict[str, Any]:
     rows = result.get("results")
     if not isinstance(rows, (list, tuple)):
         rows = []
+
     normalized_rows = []
     for row in rows:
         row = row if isinstance(row, dict) else {}
@@ -249,17 +263,18 @@ def _normalize_training(training: Any) -> dict[str, Any]:
         for metric in result["metric_names"]:
             normalized[metric] = row.get(metric)
         normalized_rows.append(normalized)
+
     result["results"] = normalized_rows
 
     if result["best_model_name"] is None:
         result["best_model_name"] = "Unavailable"
     if result["metric"] is None:
         result["metric"] = "Metric"
+
     return result
 
 
 def _normalize_operations(operations: Any) -> list[dict[str, Any]]:
-    """Ensure operation rows always have the fields expected by the template."""
     if not isinstance(operations, (list, tuple)):
         return []
 
@@ -271,11 +286,11 @@ def _normalize_operations(operations: Any) -> list[dict[str, Any]]:
             "type": str(operation.get("type", "Unknown operation")),
             "details": details if isinstance(details, dict) else {},
         })
+
     return normalized
 
 
 def _format_number(value: Any) -> str:
-    """Format finite numeric report values, displaying unavailable values safely."""
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -284,7 +299,6 @@ def _format_number(value: Any) -> str:
 
 
 def _is_png_base64(value: Any) -> bool:
-    """Ignore malformed EDA images so one corrupt figure cannot break the PDF."""
     if not isinstance(value, str) or not value:
         return False
     try:
@@ -295,27 +309,26 @@ def _is_png_base64(value: Any) -> bool:
 
 
 def _recommendations(data: dict, training: dict, task_type: str) -> list[str]:
-    recs: list[str] = []
+    recommendations: list[str] = []
     if data.get("missing_total", 0) > 0:
-        recs.append(f"Handled {data['missing_total']} missing values automatically.")
+        recommendations.append(f"Handled {data['missing_total']} missing values automatically.")
     if data.get("duplicate_rows", 0) > 0:
-        recs.append(f"Removed {data['duplicate_rows']} duplicate rows.")
+        recommendations.append(f"Removed {data['duplicate_rows']} duplicate rows.")
     try:
         best_score = float(training.get("best_score"))
     except (TypeError, ValueError, OverflowError):
         best_score = float("nan")
 
     if not math.isfinite(best_score):
-        recs.append("Model performance could not be assessed from the available metrics.")
+        recommendations.append("Model performance could not be assessed from the available metrics.")
     elif best_score < 0.7:
-        recs.append("Model performance is below 70% - consider collecting more data or feature engineering.")
+        recommendations.append("Model performance is below 70% - consider collecting more data or feature engineering.")
     else:
-        recs.append(
-            f"The winning model ({training.get('best_model_name', 'Unavailable')}) "
-            "achieved good performance."
-        )
+        recommendations.append(f"The winning model ({training.get('best_model_name', 'Unavailable')}) achieved good performance.")
+        
     if task_type == "classification":
-        recs.append("Try Boosting models (XGBoost/LightGBM) to potentially improve performance.")
+        recommendations.append("Try Boosting models (XGBoost/LightGBM) to potentially improve performance.")
     else:
-        recs.append("Consider hyperparameter tuning to further improve performance.")
-    return recs
+        recommendations.append("Consider hyperparameter tuning to further improve performance.")
+        
+    return recommendations

@@ -28,9 +28,23 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 "name": "inspect_dataset",
                 "description": (
                     "Return a structural view of the dataset: shape, columns, "
-                    "dtypes, missing counts, and the first 5 rows."
+                    "dtypes, missing counts, and unique counts. Sample rows are "
+                    "never returned unless explicitly requested."
                 ),
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "include_sample_rows": {
+                            "type": "boolean",
+                            "description": (
+                                "Explicitly opt in to returning up to 5 sample rows "
+                                "to the LLM. Defaults to false for privacy."
+                            ),
+                            "default": False,
+                        },
+                    },
+                    "required": [],
+                },
             },
         },
         {

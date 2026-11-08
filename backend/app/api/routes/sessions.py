@@ -4,11 +4,14 @@ Session management endpoints.
 from __future__ import annotations
 
 import logging
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Response
 
 from app.api.deps import DB, CurrentUser
+from app.config import settings
 from app.db import crud
 from app.schemas.session import (
     SessionCreateURL,
@@ -19,6 +22,7 @@ from app.services import session_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 @router.post("", response_model=SessionRead, status_code=201)
@@ -43,16 +47,45 @@ async def create_from_upload(
     target_column: Optional[str] = Form(None),
     notes: Optional[str] = Form(None),
 ) -> SessionRead:
-    """Create a session from an uploaded file."""
-    content = await file.read()
+    """Create a session from an uploaded file with a hard size limit."""
+    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    partial_path: Path | None = None
+
     try:
+        # Stream to a temporary file so the request body is never read in one
+        # unbounded operation. The service API remains byte-based for now.
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".upload-",
+            suffix=".part",
+            dir=settings.UPLOAD_DIR,
+            delete=False,
+        ) as partial_file:
+            partial_path = Path(partial_file.name)
+            total_bytes = 0
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds {settings.MAX_FILE_SIZE_MB} MB.",
+                    )
+                partial_file.write(chunk)
+
+        content = partial_path.read_bytes()
         obj = session_service.create_session_from_upload(
             db, user_id=current_user.id, name=name,
             original_filename=file.filename or "data.csv",
             content=content, target_column=target_column, notes=notes,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, f"Failed to create session: {exc}") from exc
+    finally:
+        if partial_path is not None:
+            partial_path.unlink(missing_ok=True)
+        await file.close()
     return SessionRead.model_validate(obj)
 
 
