@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # ---------- Database ----------
     DATABASE_URL: str = (
-        "postgresql+psycopg2://postgres:postgres@localhost:5433/AutoML"
+        "postgresql+psycopg2://postgres:postgres@localhost:5433/automl"
     )
 
     # ---------- LLM / Agent ----------

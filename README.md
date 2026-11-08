@@ -19,37 +19,78 @@ An intelligent, autonomous AI Agent that automates the entire Data Science lifec
 - **Reporting:** WeasyPrint (PDF), nbformat (Jupyter).
 - **Frontend:** React, Vite, Tailwind CSS *(Coming soon)*.
 
-## 🚀 Getting Started (Local Development)
+## 🚀 Getting Started
 
-### 1. Prerequisites
+### Prerequisites
+
 - Python 3.11+
-- PostgreSQL (or Docker)
-- Ollama (for local LLM) or an API key for Groq/OpenAI.
+- Docker Desktop with Compose v2
+- Ollama (for a local LLM) or an API key for Groq/OpenAI
 
-### 2. Installation
+### Docker Compose
+
+The default Compose stack contains PostgreSQL, Redis, the FastAPI backend, a
+Celery worker, and a one-shot migration service. Frontend services are not part
+of the default stack yet.
+
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/automl-agent.git
-cd automl-agent/backend
+copy .env.example .env  # Windows
+# cp .env.example .env  # macOS/Linux; then edit the values
+docker compose --env-file .env -f docker/docker-compose.yml up --build
+```
 
-# Create a virtual environment
+The migration service waits for PostgreSQL to become healthy. The backend and
+worker start only after `alembic upgrade head` succeeds. PostgreSQL data is
+stored in the `postgres_data` volume, Redis data in `redis_data`, and backend
+artifacts in `backend/storage`.
+
+The API is available at http://localhost:8100/docs.
+
+### Local backend development
+
+```bash
+cd backend
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-3. Environment Variables
-Copy .env.example to .env and fill in your credentials (Database URL, LLM API keys, Resend API key, etc.).
+cd ..
+```
 
-4. Database Setup
-bash
-docker run --name automl-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=automl -p 5433:5432 -d postgres:16-alpine
-5. Run the Application
-bash
-uvicorn app.main:app --reload --port 8100
-Visit http://localhost:8100/docs to access the Swagger API documentation.
+Copy `.env.example` to `.env`, start PostgreSQL and Redis, and use the host
+URLs in `.env`. From the repository root, run the migrations and application:
 
-📖 Documentation
-Architecture
+```bash
+alembic -c backend/alembic.ini upgrade head
+uvicorn app.main:app --app-dir backend --reload --port 8100
+```
 
-Security
+### Alembic commands
+
+```bash
+# Apply all migrations to a fresh database
+alembic -c backend/alembic.ini upgrade head
+
+# Inspect the current database revision
+alembic -c backend/alembic.ini current
+
+# List the migration history
+alembic -c backend/alembic.ini history
+```
+
+Migration `0001_initial_schema` is the original five-table baseline. Migration
+`0002_analysis_runs` adds `analysis_runs` and `run_events`.
+
+#### Existing databases created by the old application
+
+Do not stamp or reset an existing database automatically. First take a backup,
+then verify that its `users`, `sessions`, `messages`, `operations`, and
+`artifacts` tables match `0001_initial_schema` (columns, types, nullability,
+foreign keys, indexes, and unique constraints). Only after that verification:
+
+```bash
+alembic -c backend/alembic.ini stamp 0001_initial_schema
+alembic -c backend/alembic.ini upgrade head
+```
+
+The stamp records the verified baseline without changing application tables;
+the upgrade then applies only the new run lifecycle tables.
