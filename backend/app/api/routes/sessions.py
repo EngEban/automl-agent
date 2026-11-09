@@ -17,6 +17,7 @@ from app.schemas.session import (
     SessionCreateURL,
     SessionListItem,
     SessionRead,
+    SessionCreateKaggle,
 )
 from app.services import session_service
 
@@ -52,8 +53,6 @@ async def create_from_upload(
     partial_path: Path | None = None
 
     try:
-        # Stream to a temporary file so the request body is never read in one
-        # unbounded operation. The service API remains byte-based for now.
         with tempfile.NamedTemporaryFile(
             mode="wb",
             prefix=".upload-",
@@ -86,6 +85,21 @@ async def create_from_upload(
         if partial_path is not None:
             partial_path.unlink(missing_ok=True)
         await file.close()
+    return SessionRead.model_validate(obj)
+
+
+@router.post("/kaggle", response_model=SessionRead, status_code=201)
+def create_from_kaggle(
+    payload: SessionCreateKaggle, db: DB, current_user: CurrentUser
+) -> SessionRead:
+    """Create a session by downloading a dataset from Kaggle."""
+    try:
+        obj = session_service.create_session_from_kaggle(
+            db, user_id=current_user.id, name=payload.name, kaggle_ref=payload.kaggle_ref,
+            target_column=payload.target_column, notes=payload.notes,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to create session: {exc}") from exc
     return SessionRead.model_validate(obj)
 
 

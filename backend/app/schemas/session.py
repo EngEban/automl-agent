@@ -44,3 +44,10 @@ class SessionListItem(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+class SessionCreateKaggle(BaseModel):
+    name: str
+    kaggle_ref: str = Field(..., description="Kaggle dataset ID (e.g., 'uciml/iris')")
+    target_column: Optional[str] = None
+    notes: Optional[str] = None
+    

@@ -22,51 +22,52 @@ def _quoted(value: str) -> str:
 
 
 def _portable_filename(dataset_filename: str) -> str:
-    """Return a safe basename that preserves the uploaded filename where possible.
-
-    The notebook is distributed independently from the server, so it must never
-    embed an absolute path or a path containing parent-directory components.
-    """
+    """Return a safe basename that preserves the uploaded filename where possible."""
     raw_filename = str(dataset_filename or "").replace("\x00", "")
     filename = PurePosixPath(raw_filename.replace("\\", "/")).name
-
-    # Remove characters that are invalid on common local filesystems, as well as
-    # control characters that could make the generated notebook ambiguous.
     filename = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', "_", filename)
     filename = filename.rstrip(" .")
-
     return filename if filename not in {"", ".", ".."} else "data.csv"
 
 
-def _model_code(task_type: str, best_model_name: str) -> str:
+def _model_code(task_type: str, best_model_name: str, tuning_params: dict | None = None) -> str:
+    """Generate the Python code for the winning model with tuned params."""
     if task_type == "classification":
         models = {
-            "GradientBoosting": "GradientBoostingClassifier(random_state=42)",
-            "RandomForest": (
-                "RandomForestClassifier(n_estimators=100, "
-                "random_state=42, n_jobs=-1)"
-            ),
-            "DecisionTree": "DecisionTreeClassifier(random_state=42)",
-            "LogisticRegression": (
-                "LogisticRegression(max_iter=1000, random_state=42)"
-            ),
+            "GradientBoosting": "GradientBoostingClassifier",
+            "RandomForest": "RandomForestClassifier",
+            "DecisionTree": "DecisionTreeClassifier",
+            "HistGradientBoosting": "HistGradientBoostingClassifier",
+            "LogisticRegression": "LogisticRegression",
         }
-        return models.get(
-            best_model_name,
-            "LogisticRegression(max_iter=1000, random_state=42)",
-        )
+        base_model = models.get(best_model_name, "LogisticRegression")
+    else:
+        models = {
+            "GradientBoosting": "GradientBoostingRegressor",
+            "RandomForest": "RandomForestRegressor",
+            "DecisionTree": "DecisionTreeRegressor",
+            "HistGradientBoosting": "HistGradientBoostingRegressor",
+            "Ridge": "Ridge",
+            "LinearRegression": "LinearRegression",
+        }
+        base_model = models.get(best_model_name, "LinearRegression")
 
-    models = {
-        "GradientBoosting": "GradientBoostingRegressor(random_state=42)",
-        "RandomForest": (
-            "RandomForestRegressor(n_estimators=100, "
-            "random_state=42, n_jobs=-1)"
-        ),
-        "DecisionTree": "DecisionTreeRegressor(random_state=42)",
-        "Ridge": "Ridge(random_state=42)",
-        "LinearRegression": "LinearRegression()",
-    }
-    return models.get(best_model_name, "LinearRegression()")
+    # Default parameters based on model type
+    params = {}
+    if "RandomForest" in base_model:
+        params["n_estimators"] = 100
+        params["n_jobs"] = -1
+    elif "Logistic" in base_model:
+        params["max_iter"] = 1000
+    
+    if "Logistic" not in base_model and "Linear" not in base_model and "Ridge" not in base_model:
+        params["random_state"] = 42
+
+    if tuning_params:
+        params.update(tuning_params)
+
+    param_str = ", ".join(f"{k}={v!r}" for k, v in params.items())
+    return f"{base_model}({param_str})"
 
 
 def _evaluation_code(task_type: str) -> str:
@@ -77,7 +78,6 @@ f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 print(f"Accuracy: {accuracy:.4f}")
 print(f"F1 score: {f1:.4f}")
 """
-
     return """# Regression metrics
 r2 = r2_score(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
@@ -94,29 +94,18 @@ expected_filename = {expected_literal}
 
 try:
     from google.colab import files
-
     print(f"Please upload {{expected_filename!r}}:")
     uploaded = files.upload()
     if not uploaded:
-        raise FileNotFoundError(
-            "No file was uploaded. Please upload "
-            + repr(expected_filename)
-            + " and run this cell again."
-        )
-
+        raise FileNotFoundError("No file was uploaded.")
     if expected_filename not in uploaded:
         uploaded_names = ", ".join(repr(name) for name in uploaded)
         raise FileNotFoundError(
-            "The uploaded filename does not match the expected dataset filename "
-            + repr(expected_filename)
-            + ". Uploaded file(s): "
-            + uploaded_names
-            + ". Please upload the original file with the expected name."
+            f"The uploaded filename does not match {{expected_filename!r}}. "
+            f"Uploaded file(s): {{uploaded_names}}."
         )
-
     file_path = expected_filename
 except ImportError:
-    # In a local Jupyter environment, the dataset must be beside this notebook.
     file_path = expected_filename
 
 if not os.path.isfile(file_path):
@@ -124,29 +113,21 @@ if not os.path.isfile(file_path):
         f"Dataset file {{expected_filename!r}} was not found in the notebook's "
         f"current directory ({{os.getcwd()!r}}). "
         "If you are running this locally, make sure to download the dataset "
-        "from the web app and place it in the EXACT SAME folder as this notebook. "
-        "Place a file named "
-        + repr(expected_filename)
-        + " there, then run this cell again."
+        "from the web app and place it in the EXACT SAME folder as this notebook."
     )
 
 try:
     df = pd.read_csv(file_path)
 except pd.errors.EmptyDataError as exc:
-    raise ValueError(
-        "The dataset file is empty or has no readable column headers. "
-        "Please download a valid dataset from the web app."
-    ) from exc
+    raise ValueError("The dataset file is empty.") from exc
+
 df.columns = [str(column).strip().replace(" ", "_") for column in df.columns]
 df = df.dropna(axis=1, how="all")
+
 if df.empty:
-    raise ValueError(
-        "The dataset contains no rows. Please download and upload a non-empty dataset."
-    )
+    raise ValueError("The dataset contains no rows.")
 if df.shape[1] == 0:
-    raise ValueError(
-        "The dataset has no usable columns after removing empty columns."
-    )
+    raise ValueError("The dataset has no usable columns.")
 
 print(f"Dataset shape: {{df.shape}}")
 display(df.head())
@@ -159,15 +140,13 @@ def generate_notebook(
     target_column: str,
     task_type: str,
     best_model_name: str,
+    tuning_params: dict | None = None,
 ) -> Path:
     """Generate a portable .ipynb file and return its path."""
     expected_filename = _portable_filename(dataset_filename)
-    task_type = (
-        task_type
-        if task_type in {"classification", "regression"}
-        else "regression"
-    )
-    model_code = _model_code(task_type, best_model_name)
+    task_type = task_type if task_type in {"classification", "regression"} else "regression"
+    
+    model_code = _model_code(task_type, best_model_name, tuning_params)
 
     imports = """import os
 import numpy as np
@@ -179,6 +158,8 @@ from sklearn.ensemble import (
     GradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
@@ -210,22 +191,13 @@ The filename must be exactly `{expected_filename}`.
         """class_count = int(y.nunique())
 class_sizes = y.value_counts()
 if class_count < 2:
-    raise ValueError(
-        "Classification requires at least two target classes after removing "
-        "rows with missing targets."
-    )
+    raise ValueError("Classification requires at least two target classes.")
 if int(class_sizes.min()) < 2:
-    raise ValueError(
-        "Each target class needs at least two rows to create a reliable "
-        "train/test split. Add more rows for the least frequent class."
-    )
+    raise ValueError("Each target class needs at least two rows for a reliable split.")
 
 test_count = max(1, int(np.ceil(len(X) * 0.2)), class_count)
 if len(X) - test_count < class_count:
-    raise ValueError(
-        "There are too few rows to place every target class in both the "
-        "training and test sets. Add more rows per class."
-    )
+    raise ValueError("Too few rows to place every class in both train and test sets.")
 stratify = y
 """
         if task_type == "classification"
@@ -237,62 +209,33 @@ stratify = None
     prepare_data = f"""# 2. Prepare features and target
 target_col = {_quoted(target_column)}
 if target_col not in df.columns:
-    raise KeyError(
-        f"Target column {{target_col!r}} was not found after normalizing CSV "
-        f"column names. Available columns: {{df.columns.tolist()!r}}."
-    )
+    raise KeyError(f"Target column {{target_col!r}} not found.")
 
 df = df.dropna(subset=[target_col]).drop_duplicates().reset_index(drop=True)
 if len(df) < 2:
-    raise ValueError(
-        "At least two rows with non-missing target values are required."
-    )
+    raise ValueError("At least two rows with non-missing target values are required.")
 
 X = df.drop(columns=[target_col])
 numeric_columns = X.select_dtypes(include="number").columns
 if len(numeric_columns):
-    X.loc[:, numeric_columns] = X.loc[:, numeric_columns].replace(
-        [np.inf, -np.inf], np.nan
-    )
+    X.loc[:, numeric_columns] = X.loc[:, numeric_columns].replace([np.inf, -np.inf], np.nan)
 X = X.dropna(axis=1, how="all")
 if X.shape[1] == 0:
-    raise ValueError(
-        "No usable feature columns remain after removing all-null columns."
-    )
+    raise ValueError("No usable feature columns remain.")
 
 numeric_features = X.select_dtypes(include="number").columns.tolist()
-categorical_features = X.select_dtypes(
-    include=["object", "category", "bool"]
-).columns.tolist()
-unsupported_features = [
-    column for column in X.columns
-    if column not in numeric_features and column not in categorical_features
-]
-for column in unsupported_features:
-    non_missing = X[column].notna()
-    X[column] = X[column].astype("string").astype("object")
-    X.loc[~non_missing, column] = None
-categorical_features.extend(unsupported_features)
+categorical_features = X.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
 y = df[target_col]
 
 if y.dtype == "object" or y.dtype.name in {{"category", "string"}}:
     target_encoder = LabelEncoder()
-    y = pd.Series(
-        target_encoder.fit_transform(y),
-        name=target_col,
-        index=y.index,
-    )
+    y = pd.Series(target_encoder.fit_transform(y), name=target_col, index=y.index)
 
 {split_code}
 X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=test_count,
-    random_state=42,
-    stratify=stratify,
+    X, y, test_size=test_count, random_state=42, stratify=stratify,
 )
-
 print(f"Train set: {{X_train.shape}}, Test set: {{X_test.shape}}")
 """
 
@@ -304,39 +247,27 @@ numeric_transformer = Pipeline(steps=[
 
 categorical_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("encoder", OneHotEncoder(
-        handle_unknown="ignore",
-        sparse_output=False,
-    )),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=5)),
 ])
 
 transformers = []
-if numeric_features:
-    transformers.append(("num", numeric_transformer, numeric_features))
-if categorical_features:
-    transformers.append(("cat", categorical_transformer, categorical_features))
-if not transformers:
-    raise ValueError("No supported feature columns remain for model training.")
+if numeric_features: transformers.append(("num", numeric_transformer, numeric_features))
+if categorical_features: transformers.append(("cat", categorical_transformer, categorical_features))
+if not transformers: raise ValueError("No supported feature columns remain.")
 
 preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
 print("Preprocessor built successfully.")
 """
 
     training = f"""# 4. Define and train the winning model
-# Model selected by AutoML Agent: {best_model_name}
 model = {model_code}
-
-pipeline = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("model", model),
-])
+pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
 pipeline.fit(X_train, y_train)
 print("Model trained successfully.")
 """
 
     evaluation = """# 5. Evaluate the model
 y_pred = pipeline.predict(X_test)
-
 """ + _evaluation_code(task_type)
 
     notebook = {
@@ -344,108 +275,29 @@ y_pred = pipeline.predict(X_test)
             {
                 "cell_type": "markdown",
                 "metadata": {},
-                "source": _source_lines(
-                    """# AutoML Agent: Reproducible Analysis Pipeline
-
-This notebook was automatically generated by AutoML Agent.
-
-- Target column: {target}
-- Task type: {task}
-- Winning model: {model}
-
-Run the cells sequentially to reproduce the preprocessing, training, and evaluation steps.
-""".format(
-                        target=target_column,
-                        task=task_type,
-                        model=best_model_name,
-                    )
-                ),
+                "source": _source_lines(f"# AutoML Agent: Reproducible Pipeline\n\nTarget: `{target_column}`\n\nTask: `{task_type}`\n\nModel: `{best_model_name}`"),
             },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(imports),
-            },
-            {
-                "cell_type": "markdown",
-                "metadata": {},
-                "source": _source_lines(dataset_instructions),
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(load_dataset),
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(prepare_data),
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(preprocessing),
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(training),
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": _source_lines(evaluation),
-            },
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(imports)},
+            {"cell_type": "markdown", "metadata": {}, "source": _source_lines(dataset_instructions)},
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(load_dataset)},
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(prepare_data)},
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(preprocessing)},
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(training)},
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(evaluation)},
         ],
         "metadata": {
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3",
-            },
-            "language_info": {
-                "codemirror_mode": {
-                    "name": "ipython",
-                    "version": 3,
-                },
-                "file_extension": ".py",
-                "mimetype": "text/x-python",
-                "name": "python",
-                "nbconvert_exporter": "python",
-                "pygments_lexer": "ipython3",
-            },
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"codemirror_mode": {"name": "ipython", "version": 3}, "file_extension": ".py", "mimetype": "text/x-python", "name": "python", "nbconvert_exporter": "python", "pygments_lexer": "ipython3", "version": "3.11.9"},
         },
         "nbformat": 4,
         "nbformat_minor": 5,
     }
 
-    output_path = (
-        settings.STORAGE_DIR
-        / "sessions"
-        / session_id
-        / "analysis_pipeline.ipynb"
-    )
+    output_path = settings.STORAGE_DIR / "sessions" / session_id / "analysis_pipeline.ipynb"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
+    
     with output_path.open("w", encoding="utf-8") as notebook_file:
-        json.dump(
-            notebook,
-            notebook_file,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump(notebook, notebook_file, ensure_ascii=False, indent=2)
         notebook_file.write("\n")
 
     logger.info("Generated Jupyter Notebook: %s", output_path)

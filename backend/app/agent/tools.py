@@ -36,10 +36,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                     "properties": {
                         "include_sample_rows": {
                             "type": "boolean",
-                            "description": (
-                                "Explicitly opt in to returning up to 5 sample rows "
-                                "to the LLM. Defaults to false for privacy."
-                            ),
+                            "description": "Explicitly opt in to returning up to 5 sample rows.",
                             "default": False,
                         },
                     },
@@ -160,6 +157,26 @@ def get_tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "propose_plan",
+                "description": (
+                    "Propose an analysis plan to the user and wait for approval. "
+                    "Use this BEFORE running expensive tasks like training. "
+                    "Include target column, task type, and reasoning."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target_column": {"type": "string"},
+                        "task_type": {"type": "string", "enum": ["classification", "regression"]},
+                        "reasoning": {"type": "string", "description": "Why this plan is good."}
+                    },
+                    "required": ["target_column", "task_type", "reasoning"]
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "rerun_pipeline",
                 "description": (
                     "Run the full pipeline end-to-end (EDA -> preprocessing -> "
@@ -176,5 +193,22 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                     "required": [],
                 },
             },
+        },
+                {
+            "type": "function",
+            "function": {
+                "name": "load_from_kaggle",
+                "description": "Download a dataset from Kaggle using its reference ID (e.g., 'uciml/iris').",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kaggle_ref": {
+                            "type": "string",
+                            "description": "The Kaggle dataset identifier (owner/dataset-name)."
+                        }
+                    },
+                    "required": ["kaggle_ref"]
+                }
+            }
         },
     ]

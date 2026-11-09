@@ -3,10 +3,14 @@ SQLAlchemy engine and session factory.
 """
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(
     settings.DATABASE_URL,
@@ -22,7 +26,6 @@ SessionLocal = sessionmaker(
     expire_on_commit=False,
     class_=Session,
 )
-
 
 def get_db():
     """FastAPI dependency: yields a DB session, closes it afterwards."""

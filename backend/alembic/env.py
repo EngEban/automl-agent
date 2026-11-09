@@ -1,6 +1,4 @@
-"""Alembic migration environment."""
-from __future__ import annotations
-
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -8,31 +6,29 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
 from app.db.base import Base
-from app.db import models  # noqa: F401 - register every model with Base.metadata
 
+# استيراد جميع الموديلات لكي يتعرف عليها Alembic ويقوم بإنشاء الجداول
+from app.db.models import User, Session, Message, Operation, Artifact, AnalysisRun, RunEvent
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Alembic's ConfigParser uses '%' for interpolation. Escape literal percent
-# signs in passwords or other URL components before setting the URL.
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+# تمرير رابط قاعدة البيانات من إعداداتنا
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """Run migrations without creating a database connection."""
-    url = settings.DATABASE_URL
+    """Run migrations in 'offline' mode."""
+    url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        compare_type=True,
-        compare_server_default=True,
     )
 
     with context.begin_transaction():
@@ -40,7 +36,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations using a database connection."""
+    """Run migrations in 'online' mode."""
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -51,8 +47,7 @@ def run_migrations_online() -> None:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            compare_type=True,
-            compare_server_default=True,
+            compare_type=True,  # لاكتشاف تغييرات أنواع البيانات
         )
 
         with context.begin_transaction():

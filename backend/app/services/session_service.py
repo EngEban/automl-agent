@@ -18,6 +18,7 @@ from app.config import settings
 from app.core.data_loader import describe, load_from_bytes, load_from_url
 from app.db.crud import create_session
 from app.db.models import Session as SessionModel
+from app.core.connectors.kaggle import KaggleConnector
 
 logger = logging.getLogger(__name__)
 
@@ -125,3 +126,45 @@ def _finish_create(
     )
     logger.info("Session created: %s by user %s (%d rows)", session_id, user_id, len(df))
     return obj
+def create_session_from_kaggle(
+    db: DBSession, *, user_id: str, name: str, kaggle_ref: str,
+    target_column: str | None = None, notes: str | None = None,
+) -> SessionModel:
+    """Create a session by downloading a dataset from Kaggle."""
+    session_id = str(uuid.uuid4())
+    dest_dir = _session_dir(session_id) / "kaggle_download"
+    
+    try:
+        connector = KaggleConnector()
+        if not connector.validate_reference(kaggle_ref):
+            raise ValueError("Invalid Kaggle reference format. Use 'owner/dataset-name'.")
+            
+        provenance = connector.download_to_staging(kaggle_ref, dest_dir)
+        file_path = Path(provenance["file_path"])
+        
+        # Read the downloaded file
+        df = load_from_path(file_path)
+        
+        # Create the session
+        obj = _finish_create(
+            db, user_id=user_id, name=name, source_type="kaggle", source_path=str(file_path),
+            df=df, target_column=target_column, notes=notes, forced_id=session_id,
+            original_filename=file_path.name
+        )
+        
+        # Save provenance
+        from app.db.models import DatasetSource
+        from datetime import datetime
+        ds = DatasetSource(
+            session_id=session_id,
+            provider=provenance["provider"],
+            source_id=provenance["source_id"],
+            license=provenance["license"],
+        )
+        db.add(ds)
+        db.commit()
+        
+        return obj
+    except Exception as exc:
+        logger.error(f"Kaggle download failed: {exc}")
+        raise

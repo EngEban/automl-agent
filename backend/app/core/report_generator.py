@@ -140,7 +140,32 @@ HTML_TEMPLATE = """
     <p>This model achieved the highest {{ training.metric }} score of <strong>{{ training.best_score|number }}</strong>.</p>
   </div>
 
-  <h2>7. Recommendations</h2>
+  <h2>7. Feature Importance (Explainable AI)</h2>
+  {% if 'feature_importance' in figures %}
+  <div class="figure">
+    <img src="data:image/png;base64,{{ figures['feature_importance'] }}" alt="Feature Importance">
+  </div>
+  <p class="muted" style="font-size: 10px; color: #7f8c8d; text-align: justify;">
+    * Permutation importance measures how much model performance drops when a feature's values are randomly shuffled. 
+    Higher values indicate that the model relies heavily on that feature. 
+    This analysis describes model behavior, not causality.
+  </p>
+  {% else %}
+  <p class="muted">Feature importance could not be calculated for this run (e.g., due to small dataset size).</p>
+  {% endif %}
+
+  {% if 'confusion_matrix' in figures %}
+  <h2>8. Classification Evaluation</h2>
+  <div class="figure"><img src="data:image/png;base64,{{ figures['confusion_matrix'] }}" alt="Confusion Matrix"></div>
+  {% endif %}
+
+  {% if 'predicted_vs_actual' in figures %}
+  <h2>8. Regression Evaluation</h2>
+  <div class="figure"><img src="data:image/png;base64,{{ figures['predicted_vs_actual'] }}" alt="Predicted vs Actual"></div>
+  <div class="figure"><img src="data:image/png;base64,{{ figures['residuals'] }}" alt="Residuals"></div>
+  {% endif %}
+
+  <h2>9. Recommendations</h2>
   <ul>{% for rec in recommendations %}<li>{{ rec }}</li>{% endfor %}</ul>
 
   <div class="footer">This report was generated automatically by AutoML Agent</div>

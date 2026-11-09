@@ -88,6 +88,7 @@ class Settings(BaseSettings):
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+
 settings = Settings()
 
 

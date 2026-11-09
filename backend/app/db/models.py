@@ -154,3 +154,66 @@ class RunEvent(Base):
 
     def __repr__(self) -> str:
         return f"<RunEvent id={self.id} type={self.event_type}>"
+
+class Experiment(Base):
+    __tablename__ = "experiments"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("analysis_runs.id", ondelete="CASCADE"), nullable=False)
+    session_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    run: Mapped["AnalysisRun"] = relationship("AnalysisRun")
+    session: Mapped["Session"] = relationship("Session")
+    model_versions: Mapped[list["ModelVersion"]] = relationship("ModelVersion", back_populates="experiment", cascade="all, delete-orphan")
+
+
+class ModelVersion(Base):
+    __tablename__ = "model_versions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    experiment_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("experiments.id", ondelete="CASCADE"), nullable=False)
+    
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    artifact_uri: Mapped[str] = mapped_column(Text, nullable=False) # Path to .pkl
+    schema_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False) # Expected input columns
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False) # R2, F1, etc.
+    parameters_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False) # Optuna params
+    lifecycle_status: Mapped[str] = mapped_column(String(20), default="candidate", nullable=False) # candidate, production, archived
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    experiment: Mapped["Experiment"] = relationship("Experiment", back_populates="model_versions")
+
+class AnalysisPlan(Base):
+    __tablename__ = "analysis_plans"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("analysis_runs.id", ondelete="CASCADE"), nullable=False)
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+    plan_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    confidence: Mapped[float] = mapped_column(default=1.0, nullable=False)
+    approval_status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False) # pending, approved, rejected
+    approved_by: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    run: Mapped["AnalysisRun"] = relationship("AnalysisRun")
+
+class DatasetSource(Base):
+    __tablename__ = "dataset_sources"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False) # e.g., kaggle, uci, huggingface, local
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False) # The identifier or URL
+    revision: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    license: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    checksum: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    download_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    session: Mapped["Session"] = relationship("Session")

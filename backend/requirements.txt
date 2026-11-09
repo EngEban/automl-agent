@@ -24,6 +24,8 @@ numpy==1.26.4
 scikit-learn==1.5.1
 scipy==1.14.0
 joblib==1.4.2
+optuna==3.6.1
+kaggle==1.6.17
 
 # Visualization
 matplotlib==3.10.8

@@ -8,9 +8,14 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DBSession
 
-from app.db.models import Artifact, Message, Operation, Session, User
+from app.db.models import (
+    Artifact, Experiment, Message, Operation, Session, User, ModelVersion,
+    AnalysisRun, RunEvent, AnalysisPlan, DatasetSource
+)
 
-# ---------- User ----------
+# ==========================================
+# USER
+# ==========================================
 def get_user_by_email(db: DBSession, email: str) -> Optional[User]:
     return db.query(User).filter(User.email == email).first()
 
@@ -31,7 +36,9 @@ def update_user(db: DBSession, user_id: str, **updates) -> Optional[User]:
     db.refresh(obj)
     return obj
 
-# ---------- Session ----------
+# ==========================================
+# SESSION
+# ==========================================
 def create_session(db: DBSession, **kwargs) -> Session:
     obj = Session(**kwargs)
     db.add(obj)
@@ -43,7 +50,6 @@ def get_session(db: DBSession, session_id: str) -> Optional[Session]:
     try:
         return db.get(Session, session_id)
     except Exception:
-        # Catch invalid UUID format errors from PostgreSQL
         return None
 
 def list_sessions(db: DBSession, user_id: str, limit: int = 50, offset: int = 0) -> list[Session]:
@@ -82,7 +88,9 @@ def delete_session(db: DBSession, session_id: str) -> bool:
         db.rollback()
         return False
 
-# ---------- Message ----------
+# ==========================================
+# MESSAGE
+# ==========================================
 def create_message(db: DBSession, **kwargs) -> Message:
     obj = Message(**kwargs)
     db.add(obj)
@@ -99,7 +107,9 @@ def list_messages(db: DBSession, session_id: str, limit: int = 200) -> list[Mess
     )
     return list(db.scalars(stmt))
 
-# ---------- Operation ----------
+# ==========================================
+# OPERATION
+# ==========================================
 def create_operation(db: DBSession, **kwargs) -> Operation:
     obj = Operation(**kwargs)
     db.add(obj)
@@ -115,7 +125,9 @@ def list_operations(db: DBSession, session_id: str) -> list[Operation]:
     )
     return list(db.scalars(stmt))
 
-# ---------- Artifact ----------
+# ==========================================
+# ARTIFACT
+# ==========================================
 def create_artifact(db: DBSession, **kwargs) -> Artifact:
     obj = Artifact(**kwargs)
     db.add(obj)
@@ -131,9 +143,9 @@ def list_artifacts(db: DBSession, session_id: str) -> list[Artifact]:
     )
     return list(db.scalars(stmt))
 
-# ---------- AnalysisRun ----------
-from app.db.models import AnalysisRun, RunEvent
-
+# ==========================================
+# ANALYSIS RUN
+# ==========================================
 def create_run(db: DBSession, **kwargs) -> AnalysisRun:
     obj = AnalysisRun(**kwargs)
     db.add(obj)
@@ -165,7 +177,18 @@ def list_runs_for_session(db: DBSession, session_id: str) -> list[AnalysisRun]:
     )
     return list(db.scalars(stmt))
 
-# ---------- RunEvent ----------
+def get_latest_run_for_session(db: DBSession, session_id: str) -> Optional[AnalysisRun]:
+    stmt = (
+        select(AnalysisRun)
+        .where(AnalysisRun.session_id == session_id)
+        .order_by(AnalysisRun.created_at.desc())
+        .limit(1)
+    )
+    return db.scalars(stmt).first()
+
+# ==========================================
+# RUN EVENT (SSE)
+# ==========================================
 def create_event(db: DBSession, **kwargs) -> RunEvent:
     obj = RunEvent(**kwargs)
     db.add(obj)
@@ -181,3 +204,83 @@ def list_events_for_run(db: DBSession, run_id: str, limit: int = 100) -> list[Ru
         .limit(limit)
     )
     return list(db.scalars(stmt))
+
+# ==========================================
+# EXPERIMENT
+# ==========================================
+def create_experiment(db: DBSession, **kwargs) -> Experiment:
+    obj = Experiment(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def get_experiment(db: DBSession, experiment_id: str) -> Optional[Experiment]:
+    return db.get(Experiment, experiment_id)
+
+# ==========================================
+# MODEL VERSION (REGISTRY)
+# ==========================================
+def create_model_version(db: DBSession, **kwargs) -> ModelVersion:
+    obj = ModelVersion(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def get_model_version(db: DBSession, model_version_id: str) -> Optional[ModelVersion]:
+    return db.get(ModelVersion, model_version_id)
+
+def list_model_versions(db: DBSession, session_id: str) -> list[ModelVersion]:
+    stmt = (
+        select(ModelVersion)
+        .join(Experiment)
+        .where(Experiment.session_id == session_id)
+        .order_by(ModelVersion.created_at.desc())
+    )
+    return list(db.scalars(stmt))
+
+# ==========================================
+# ANALYSIS PLAN (PHASE 4)
+# ==========================================
+def create_plan(db: DBSession, **kwargs) -> AnalysisPlan:
+    obj = AnalysisPlan(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def get_plan(db: DBSession, plan_id: str) -> Optional[AnalysisPlan]:
+    try:
+        return db.get(AnalysisPlan, plan_id)
+    except Exception:
+        return None
+
+def get_latest_plan_for_run(db: DBSession, run_id: str) -> Optional[AnalysisPlan]:
+    stmt = (
+        select(AnalysisPlan)
+        .where(AnalysisPlan.run_id == run_id)
+        .order_by(AnalysisPlan.created_at.desc())
+        .limit(1)
+    )
+    return db.scalars(stmt).first()
+
+def update_plan(db: DBSession, plan_id: str, **updates) -> Optional[AnalysisPlan]:
+    obj = db.get(AnalysisPlan, plan_id)
+    if obj is None:
+        return None
+    for key, value in updates.items():
+        setattr(obj, key, value)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+# ==========================================
+# DATASET SOURCE (PHASE 5)
+# ==========================================
+def create_dataset_source(db: DBSession, **kwargs) -> DatasetSource:
+    obj = DatasetSource(**kwargs)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
