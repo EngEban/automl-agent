@@ -4,15 +4,28 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from kaggle.api.kaggle_api_extended import KaggleApi
 from app.core.connectors.base import DataSourceConnector
 
 logger = logging.getLogger(__name__)
 
+
+class KaggleConfigurationError(RuntimeError):
+    """Raised when the Kaggle API cannot be configured for an operation."""
+
+
 class KaggleConnector(DataSourceConnector):
     def __init__(self):
-        self.api = KaggleApi()
-        self.api.authenticate()
+        try:
+            from kaggle.api.kaggle_api_extended import KaggleApi
+
+            self.api = KaggleApi()
+            self.api.authenticate()
+        except OSError as exc:
+            raise KaggleConfigurationError(
+                "Kaggle credentials are not configured. Configure a Kaggle API "
+                "token by placing kaggle.json in ~/.kaggle or setting the "
+                "KAGGLE_USERNAME and KAGGLE_KEY environment variables."
+            ) from exc
 
     def validate_reference(self, reference: str) -> bool:
         # Kaggle references look like: "owner/dataset-name"

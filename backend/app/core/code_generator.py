@@ -192,16 +192,16 @@ The filename must be exactly `{expected_filename}`.
 class_sizes = y.value_counts()
 if class_count < 2:
     raise ValueError("Classification requires at least two target classes.")
-if int(class_sizes.min()) < 2:
-    raise ValueError("Each target class needs at least two rows for a reliable split.")
+if int(class_sizes.min()) < 3:
+    raise ValueError("Each target class needs at least three rows for a stratified train/test split.")
 
-test_count = max(1, int(np.ceil(len(X) * 0.2)), class_count)
+test_count = max(2, int(np.ceil(len(X) * 0.2)), class_count)
 if len(X) - test_count < class_count:
     raise ValueError("Too few rows to place every class in both train and test sets.")
 stratify = y
 """
         if task_type == "classification"
-        else """test_count = max(1, int(np.ceil(len(X) * 0.2)))
+        else """test_count = max(2, int(np.ceil(len(X) * 0.2)))
 stratify = None
 """
     )
@@ -219,7 +219,6 @@ X = df.drop(columns=[target_col])
 numeric_columns = X.select_dtypes(include="number").columns
 if len(numeric_columns):
     X.loc[:, numeric_columns] = X.loc[:, numeric_columns].replace([np.inf, -np.inf], np.nan)
-X = X.dropna(axis=1, how="all")
 if X.shape[1] == 0:
     raise ValueError("No usable feature columns remain.")
 
@@ -228,26 +227,36 @@ categorical_features = X.select_dtypes(include=["object", "category", "bool"]).c
 
 y = df[target_col]
 
-if y.dtype == "object" or y.dtype.name in {{"category", "string"}}:
-    target_encoder = LabelEncoder()
-    y = pd.Series(target_encoder.fit_transform(y), name=target_col, index=y.index)
-
 {split_code}
-X_train, X_test, y_train, y_test = train_test_split(
+X_train, X_test, y_train_raw, y_test_raw = train_test_split(
     X, y, test_size=test_count, random_state=42, stratify=stratify,
 )
+
+# Fit target-label mapping on the training labels after the split.
+target_encoder = None
+if y_train_raw.dtype == "object" or y_train_raw.dtype.name in {{"category", "string"}}:
+    target_encoder = LabelEncoder()
+    y_train = pd.Series(
+        target_encoder.fit_transform(y_train_raw), name=target_col, index=y_train_raw.index
+    )
+    y_test = pd.Series(
+        target_encoder.transform(y_test_raw), name=target_col, index=y_test_raw.index
+    )
+else:
+    y_train, y_test = y_train_raw, y_test_raw
+
 print(f"Train set: {{X_train.shape}}, Test set: {{X_test.shape}}")
 """
 
     preprocessing = """# 3. Build the preprocessing pipeline
 numeric_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="median")),
+    ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
     ("scaler", StandardScaler()),
 ])
 
 categorical_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=5)),
+    ("imputer", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=0.05, max_categories=50)),
 ])
 
 transformers = []

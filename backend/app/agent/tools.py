@@ -28,8 +28,10 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 "name": "inspect_dataset",
                 "description": (
                     "Return a structural view of the dataset: shape, columns, "
-                    "dtypes, missing counts, and unique counts. Sample rows are "
-                    "never returned unless explicitly requested."
+                    "dtypes, missingness, cardinality, identifier/date hints, "
+                    "outliers, duplicates, and target-column suggestions. "
+                    "If suggestions are ambiguous or unavailable, ask the user "
+                    "to choose a target. Sample rows are never returned unless requested."
                 ),
                 "parameters": {
                     "type": "object",
@@ -50,8 +52,9 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 "name": "run_eda",
                 "description": (
                     "Run exploratory data analysis on the dataset. Returns a "
-                    "summary dict; figures are attached to the session and shown "
-                    "in the final report."
+                    "descriptive profile, target distribution when Task 07 has "
+                    "resolved the task type, and figures attached to the session. "
+                    "Profiling does not choose or fit training preprocessing."
                 ),
                 "parameters": {
                     "type": "object",
@@ -71,8 +74,8 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 "name": "run_preprocessing",
                 "description": (
                     "Build and apply a preprocessing pipeline (missing-value "
-                    "imputation, encoding, scaling). Returns the list of "
-                    "operations applied."
+                    "imputation, encoding, scaling) schema. Learned values are "
+                    "fit during model training. Returns the list of operations."
                 ),
                 "parameters": {
                     "type": "object",
@@ -188,6 +191,11 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                         "target_column": {
                             "type": "string",
                             "description": "Optional new target column.",
+                        },
+                        "task_type": {
+                            "type": "string",
+                            "enum": ["classification", "regression", "auto"],
+                            "description": "Optional explicit task type; an approved plan is used when omitted.",
                         },
                     },
                     "required": [],

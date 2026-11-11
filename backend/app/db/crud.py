@@ -208,11 +208,14 @@ def list_events_for_run(db: DBSession, run_id: str, limit: int = 100) -> list[Ru
 # ==========================================
 # EXPERIMENT
 # ==========================================
-def create_experiment(db: DBSession, **kwargs) -> Experiment:
+def create_experiment(db: DBSession, *, commit: bool = True, **kwargs) -> Experiment:
     obj = Experiment(**kwargs)
     db.add(obj)
-    db.commit()
-    db.refresh(obj)
+    if commit:
+        db.commit()
+        db.refresh(obj)
+    else:
+        db.flush()
     return obj
 
 def get_experiment(db: DBSession, experiment_id: str) -> Optional[Experiment]:
@@ -221,11 +224,14 @@ def get_experiment(db: DBSession, experiment_id: str) -> Optional[Experiment]:
 # ==========================================
 # MODEL VERSION (REGISTRY)
 # ==========================================
-def create_model_version(db: DBSession, **kwargs) -> ModelVersion:
+def create_model_version(db: DBSession, *, commit: bool = True, **kwargs) -> ModelVersion:
     obj = ModelVersion(**kwargs)
     db.add(obj)
-    db.commit()
-    db.refresh(obj)
+    if commit:
+        db.commit()
+        db.refresh(obj)
+    else:
+        db.flush()
     return obj
 
 def get_model_version(db: DBSession, model_version_id: str) -> Optional[ModelVersion]:

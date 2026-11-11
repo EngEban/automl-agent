@@ -21,10 +21,14 @@ from app.core import trainer as trainer_mod
 from app.core.code_generator import generate_notebook
 from app.core.data_loader import describe, load_from_path, load_from_url
 from app.core.data_profiler import profile_dataset
-from app.core.model_selector import auto_detect_target, detect_task_type
+from app.core.model_selector import (
+    auto_detect_target,
+    is_categorical_target_schema,
+    validate_target_column,
+)
 from app.core.report_generator import generate_report as render_report
 from app.db.crud import (
-    create_artifact, create_operation, get_session, list_artifacts, list_operations,
+    create_artifact, create_operation, get_run, get_session, list_artifacts, list_operations,
     update_session, create_experiment, create_model_version, create_plan,
     get_latest_run_for_session, update_run, create_dataset_source,
 )
@@ -34,6 +38,30 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_DIR = settings.STORAGE_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class ModelRegistryPersistenceError(RuntimeError):
+    """Raised when a trained model cannot be registered atomically."""
+
+
+def _require_training_run(db: DBSession, session_id: str, run_id: str | None):
+    if not run_id:
+        raise ValueError(
+            "Training requires an explicit AnalysisRun context; no experiment "
+            "was registered."
+        )
+
+    run = get_run(db, run_id)
+    if run is None:
+        raise ValueError(
+            f"AnalysisRun '{run_id}' was not found; no experiment was registered."
+        )
+    if str(run.session_id) != str(session_id):
+        raise ValueError(
+            f"AnalysisRun '{run_id}' does not belong to session '{session_id}'; "
+            "no experiment was registered."
+        )
+    return run
 
 
 # ---------- path helpers ----------
@@ -99,7 +127,10 @@ def _tool_inspect_dataset(session_id: str, args: dict, db: DBSession) -> dict:
     """Return structural view and data quality profile."""
     df = _load_raw(db, session_id)
     info = describe(df)
-    profile = profile_dataset(df)
+    session = get_session(db, session_id)
+    target = session.target_column if session else None
+    task_type = session.task_type if session else None
+    profile = profile_dataset(df, target=target, task_type=task_type)
     
     profile_path = _session_dir(session_id) / "dataset_profile.json"
     profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
@@ -111,7 +142,35 @@ def _tool_inspect_dataset(session_id: str, args: dict, db: DBSession) -> dict:
         "missing_total": info["missing_total"],
         "duplicate_rows": info["duplicate_rows"],
         "quality_score": profile.quality_score,
-        "warnings": profile.warnings,
+        "warnings": profile.warnings[:20],
+        "warning_count": len(profile.warnings),
+        "profile_summary": {
+            "numeric_columns": profile.numeric_count,
+            "categorical_columns": profile.categorical_count,
+            "boolean_columns": profile.boolean_count,
+            "date_columns": profile.date_count,
+            "missing_count": profile.missing_count,
+            "missing_percentage": profile.missing_percentage,
+            "duplicate_rows": profile.duplicate_row_count,
+            "memory_usage_bytes": profile.memory_usage_bytes,
+            "target": profile.target_info,
+        },
+        "columns_to_review": [
+            {
+                "name": column.name,
+                "detected_type": column.detected_type,
+                "missing_percentage": column.missing_percentage,
+                "unique_count": column.unique_count,
+                "cardinality_percentage": column.cardinality_percentage,
+                "constant": column.is_constant,
+                "near_constant": column.is_near_constant,
+                "likely_identifier": column.likely_id,
+                "high_cardinality": column.is_high_cardinality,
+                "date_like": column.is_date_like,
+                "issues": column.potential_issues,
+            }
+            for column in profile.columns if column.potential_issues
+        ][:20],
         "target_suggestions": auto_detect_target(df),
     }
 
@@ -126,13 +185,21 @@ def _tool_run_eda(session_id: str, args: dict, db: DBSession) -> dict:
     df = _load_raw(db, session_id)
     session = get_session(db, session_id)
     target = args.get("target_column") or (session.target_column if session else None)
-    result = eda_mod.run_eda(df, target)
+    task_type = session.task_type if session else None
+    result = eda_mod.run_eda(df, target, task_type=task_type)
     session_dir = _session_dir(session_id)
     (session_dir / "eda_summary.json").write_text(json.dumps(result["summary"], ensure_ascii=False, indent=2), encoding="utf-8")
     (session_dir / "eda_figures.json").write_text(json.dumps(result["figures"], ensure_ascii=False), encoding="utf-8")
     update_session(db, session_id, status="eda_done")
     create_operation(db, session_id=session_id, op_type="eda", details={"target": target})
-    return {"shape": result["summary"]["shape"], "readiness": result["summary"]["readiness"], "n_figures": len(result["figures"])}
+    return {
+        "shape": result["summary"]["shape"],
+        "readiness": result["summary"]["readiness"],
+        "important_findings": result["summary"].get("important_findings", []),
+        "target_profile": result["summary"].get("profile", {}).get("target_info"),
+        "task_type": task_type,
+        "n_figures": len(result["figures"]),
+    }
 
 
 def _tool_run_preprocessing(session_id: str, args: dict, db: DBSession) -> dict:
@@ -140,73 +207,118 @@ def _tool_run_preprocessing(session_id: str, args: dict, db: DBSession) -> dict:
     target = args.get("target_column")
     if not target:
         raise ValueError("target_column is required for preprocessing.")
-    X, y, target_ops = prep_mod.prepare_xy(df, target)
+    X, y, target_ops = prep_mod.prepare_xy_for_training(df, target)
     
-    # Export cleaned dataset
+    # Export rows with nonlearning cleanup only. Missing-value statistics are
+    # fitted later inside each training/CV pipeline, never on this full dataset.
     cleaned_features = X.copy()
     for column in cleaned_features.columns:
         values = cleaned_features[column]
         if pd.api.types.is_numeric_dtype(values.dtype):
-            fill_value = values.median()
-            if pd.notna(fill_value):
-                cleaned_features[column] = values.astype("float64").fillna(float(fill_value))
-        else:
-            modes = values.mode(dropna=True)
-            if not modes.empty:
-                cleaned_features[column] = values.fillna(modes.iloc[0])
-
-    retained_rows = df.dropna(subset=[target]).drop_duplicates().reset_index(drop=True)
+            cleaned_features[column] = values.replace([np.inf, -np.inf], np.nan)
     cleaned_data = cleaned_features.reset_index(drop=True)
-    cleaned_data[target] = retained_rows[target].to_numpy()
+    cleaned_data[target] = y.reset_index(drop=True).to_numpy()
     cleaned_path = _session_dir(session_id) / "cleaned_data.csv"
     cleaned_data.to_csv(cleaned_path, index=False, encoding="utf-8-sig")
 
     preprocessor, prep_ops = prep_mod.build_preprocessor(X)
-    X_processed = preprocessor.fit_transform(X)
-    Xdf = pd.DataFrame(X_processed)
     session_dir = _session_dir(session_id)
-    Xdf.to_pickle(session_dir / "processed.pkl")
     y.to_frame(name="__target__").to_pickle(session_dir / "target.pkl")
+    # Keep only the schema blueprint here. The model trainer creates fresh
+    # copies and fits them inside each CV fold and the final training split.
     joblib.dump(preprocessor, session_dir / "preprocessor.pkl")
 
     state = _load_state(session_id)
     state["target_column"] = target
-    state["task_type"] = detect_task_type(y, df[target])
+    # Task type is resolved once by the trainer using its training-only probe.
+    state["task_type"] = None
     _save_state(session_id, state)
 
     all_ops = target_ops + prep_ops
     for operation in all_ops:
         create_operation(db, session_id=session_id, op_type=operation.get("type", "unknown"), details=operation)
 
-    create_artifact(db, session_id=session_id, artifact_type="cleaned_data", file_path=str(cleaned_path), meta={"target_column": target, "imputed": True})
-    update_session(db, session_id, target_column=target, task_type=state["task_type"], status="preprocessed")
-    return {"operations": all_ops, "task_type": state["task_type"], "cleaned_data_path": str(cleaned_path)}
+    create_artifact(db, session_id=session_id, artifact_type="cleaned_data", file_path=str(cleaned_path), meta={"target_column": target, "imputed": False, "imputation_fit": "inside training folds and production training only"})
+    update_session(db, session_id, target_column=target, task_type=None, status="preprocessed")
+    return {
+        "operations": all_ops,
+        "task_type": None,
+        "task_type_status": "pending_training_inference",
+        "cleaned_data_path": str(cleaned_path),
+    }
 
 
-def _tool_train_models(session_id: str, args: dict, db: DBSession) -> dict:
-    session_dir = _session_dir(session_id)
-    df = _load_raw(db, session_id)
+def _tool_train_models(
+    session_id: str,
+    args: dict,
+    db: DBSession,
+    run_id: str | None = None,
+) -> dict:
     session = get_session(db, session_id)
     if session is None:
         raise ValueError(f"Session '{session_id}' not found.")
+    run = _require_training_run(db, session_id, run_id)
+
+    session_dir = _session_dir(session_id)
+    df = _load_raw(db, session_id)
     target = session.target_column
     if not target:
         raise ValueError("Target column is not set in the session.")
 
-    X, y, _ = prep_mod.prepare_xy(df, target)
+    X, y, _ = prep_mod.prepare_xy_for_training(df, target)
     preprocessor, _ = prep_mod.build_preprocessor(X)
     state = _load_state(session_id)
     task_type = args.get("task_type", "auto") if isinstance(args, dict) else "auto"
-    if task_type == "auto":
-        task_type = state.get("task_type") or detect_task_type(y, df[target])
+    if task_type is None:
+        task_type = "auto"
+    target_is_categorical = is_categorical_target_schema(df[target])
+    training = trainer_mod.train_and_evaluate(
+        X,
+        y,
+        preprocessor,
+        task_type,
+        target_is_categorical=target_is_categorical,
+        target_name=target,
+    )
+    task_type = training.get("task_type", task_type)
+    target_encoder = training.get("target_encoder")
+    preprocessing_operations = training.get("preprocessing_operations", [])
 
-    training = trainer_mod.train_and_evaluate(X, y, preprocessor, task_type)
+    state["preprocessing_operations"] = preprocessing_operations
+    for operation in preprocessing_operations:
+        create_operation(
+            db,
+            session_id=session_id,
+            op_type=operation.get("type", "preprocessing_decision"),
+            details=operation,
+        )
 
+    profile = profile_dataset(df, target=target, task_type=task_type)
+    profile_path = session_dir / "dataset_profile.json"
+    profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+    eda_summary_path = session_dir / "eda_summary.json"
+    if eda_summary_path.exists():
+        eda_summary = json.loads(eda_summary_path.read_text(encoding="utf-8"))
+        eda_summary.update({
+            "profile": profile.model_dump(mode="json"),
+            "important_findings": profile.warnings[:12],
+            "target": target,
+            "task_type": task_type,
+        })
+        eda_summary_path.write_text(
+            json.dumps(eda_summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    state["task_type"] = task_type
     state["best_model"] = training["best_model_name"]
     state["best_score"] = training["best_score"]
     state["metric"] = training["metric"]
     state["metric_names"] = training["metric_names"]
     state["results"] = training["results"]
+    state["cv_selection_score"] = training.get("cv_selection_score", training["best_score"])
+    state["selection_metric"] = training.get("selection_metric", training["metric"])
+    state["evaluation"] = training.get("evaluation")
+    state["final_test_metrics"] = training.get("final_test_metrics")
     if training.get("tuning_params"):
         state["tuning_params"] = training["tuning_params"]
     _save_state(session_id, state)
@@ -218,28 +330,109 @@ def _tool_train_models(session_id: str, args: dict, db: DBSession) -> dict:
     if training.get("extra_charts"):
         (session_dir / "extra_charts.json").write_text(json.dumps(training["extra_charts"], ensure_ascii=False), encoding="utf-8")
 
-    joblib.dump(training["best_model"], session_dir / "best_model.pkl")
+    model_artifact_path = session_dir / "best_model.pkl"
+    joblib.dump(
+        {
+            "artifact_format_version": 1,
+            "pipeline": training["best_model"],
+            "target_encoder": target_encoder,
+            "task_type": task_type,
+            "input_columns": list(X.columns),
+        },
+        model_artifact_path,
+    )
     (session_dir / "training_results.json").write_text(
-        json.dumps({"results": training["results"], "best": training["best_model_name"], "score": training["best_score"], "metric": training["metric"]}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "results": training["results"],
+                "best": training["best_model_name"],
+                "score": training["best_score"],
+                "cv_selection_score": training.get(
+                    "cv_selection_score", training["best_score"]
+                ),
+                "selection_metric": training.get(
+                    "selection_metric", training["metric"]
+                ),
+                "metric": training["metric"],
+                "evaluation": training.get("evaluation"),
+                "final_test_metrics": training.get("final_test_metrics"),
+                "preprocessing_operations": preprocessing_operations,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    update_session(db, session_id, status="trained")
+    update_session(db, session_id, task_type=task_type, status="trained")
 
-    # Register in Model Registry
+    # Register in Model Registry as one atomic unit. The explicit run context
+    # is validated above; never infer it from the session's latest run.
     try:
-        experiment = create_experiment(db, run_id=session_id, session_id=session_id, name=f"Experiment_{training['best_model_name']}", config_json={"target": target, "task_type": task_type})
-        artifact_uri = str(session_dir / "best_model.pkl")
+        artifact_uri = str(model_artifact_path)
         input_schema = {col: str(dtype) for col, dtype in X.dtypes.items()}
-        create_model_version(
-            db, experiment_id=experiment.id, model_name=training["best_model_name"], artifact_uri=artifact_uri,
-            schema_json=input_schema, metrics_json={k: v for k, v in training.items() if k in ["best_score", "metric"]},
-            parameters_json=training.get("tuning_params", {}), lifecycle_status="candidate",
+        metrics = {
+            "best_score": training["best_score"],
+            "metric": training["metric"],
+            "metric_names": training.get("metric_names", []),
+            "results": training.get("results", []),
+            "cv_selection_score": training.get(
+                "cv_selection_score", training["best_score"]
+            ),
+            "selection_metric": training.get(
+                "selection_metric", training["metric"]
+            ),
+            "evaluation": training.get("evaluation"),
+            "final_test_metrics": training.get("final_test_metrics"),
+        }
+        experiment = create_experiment(
+            db,
+            run_id=run.id,
+            session_id=session.id,
+            name=f"Experiment_{training['best_model_name']}",
+            config_json={"target": target, "task_type": task_type},
+            commit=False,
         )
+        create_model_version(
+            db,
+            experiment_id=experiment.id,
+            model_name=training["best_model_name"],
+            artifact_uri=artifact_uri,
+            schema_json=input_schema,
+            metrics_json=metrics,
+            parameters_json=training.get("tuning_params", {}),
+            lifecycle_status="candidate",
+            commit=False,
+        )
+        db.commit()
         logger.info("Registered model version in DB.")
     except Exception as exc:
-        logger.error("Failed to register model version: %s", exc)
+        db.rollback()
+        logger.exception(
+            "Failed to register model version for run %s and session %s",
+            run.id,
+            session.id,
+        )
+        raise ModelRegistryPersistenceError(
+            f"Model Registry persistence failed for AnalysisRun '{run.id}' "
+            f"and session '{session.id}'."
+        ) from exc
         
-    return {"best_model": training["best_model_name"], "best_score": round(training["best_score"], 4), "metric": training["metric"], "results": training["results"]}
+    return {
+        "best_model": training["best_model_name"],
+        "task_type": task_type,
+        "best_score": round(training["best_score"], 4),
+        "metric": training["metric"],
+        "results": training["results"],
+        "cv_selection_score": training.get(
+            "cv_selection_score", training["best_score"]
+        ),
+        "selection_metric": training.get(
+            "selection_metric", training["metric"]
+        ),
+        "evaluation": training.get("evaluation"),
+        "final_test_metrics": training.get("final_test_metrics"),
+        "preprocessing_operations": preprocessing_operations,
+    }
 
 
 def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
@@ -283,6 +476,11 @@ def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
     training_payload = {
         "results": state["results"], "best_model_name": state["best_model"],
         "best_score": state["best_score"], "metric": state["metric"], "metric_names": state["metric_names"],
+        "cv_selection_score": state.get("cv_selection_score", state["best_score"]),
+        "selection_metric": state.get("selection_metric", state["metric"]),
+        "evaluation": state.get("evaluation"),
+        "final_test_metrics": state.get("final_test_metrics"),
+        "preprocessing_operations": state.get("preprocessing_operations", []),
     }
 
     pdf_path = render_report(
@@ -319,8 +517,10 @@ def _tool_get_operations_log(session_id: str, args: dict, db: DBSession) -> dict
 
 def _tool_set_target_column(session_id: str, args: dict, db: DBSession) -> dict:
     column = args.get("column")
-    if not column:
+    if column is None:
         raise ValueError("column is required.")
+    df = _load_raw(db, session_id)
+    validate_target_column(df, column)
     update_session(db, session_id, target_column=column)
     state = _load_state(session_id)
     state["target_column"] = column
@@ -333,6 +533,10 @@ def _tool_propose_plan(session_id: str, args: dict, db: DBSession) -> dict:
     run = get_latest_run_for_session(db, session_id)
     if not run:
         raise ValueError("No active run found for this session.")
+    df = _load_raw(db, session_id)
+    validate_target_column(df, args.get("target_column"))
+    if args.get("task_type") not in {"classification", "regression"}:
+        raise ValueError("A plan must specify classification or regression.")
         
     plan = create_plan(db, run_id=run.id, plan_json=args, approval_status="pending")
     update_run(db, run.id, status="awaiting_approval")
@@ -395,9 +599,35 @@ def _tool_load_from_kaggle(session_id: str, args: dict, db: DBSession) -> dict:
     }
 
 
-def _tool_rerun_pipeline(session_id: str, args: dict, db: DBSession) -> dict:
-    if args.get("target_column"):
-        _tool_set_target_column(session_id, {"column": args["target_column"]}, db)
+def _tool_rerun_pipeline(
+    session_id: str,
+    args: dict,
+    db: DBSession,
+    run_id: str | None = None,
+) -> dict:
+    requested_task_type = args.get("task_type")
+    if requested_task_type is not None and requested_task_type not in {
+        "classification", "regression", "auto"
+    }:
+        raise ValueError(
+            f"Unsupported task type '{requested_task_type}'. Choose classification, regression, or auto."
+        )
+
+    approved_plan = None
+    plan_run = get_run(db, run_id) if run_id else get_latest_run_for_session(db, session_id)
+    if plan_run is not None:
+        from app.db.crud import get_latest_plan_for_run
+
+        candidate_plan = get_latest_plan_for_run(db, plan_run.id)
+        if candidate_plan is not None and candidate_plan.approval_status == "approved":
+            approved_plan = candidate_plan.plan_json
+
+    if args.get("target_column") is not None:
+        target_override = args["target_column"]
+    else:
+        target_override = (approved_plan or {}).get("target_column")
+    if target_override is not None:
+        _tool_set_target_column(session_id, {"column": target_override}, db)
 
     session = get_session(db, session_id)
     if session is None:
@@ -409,14 +639,25 @@ def _tool_rerun_pipeline(session_id: str, args: dict, db: DBSession) -> dict:
         target_info = auto_detect_target(df)
         target = target_info["best"]
         if not target:
-            raise ValueError("A target column is required to run the pipeline.")
+            raise ValueError(target_info["message"])
         _tool_set_target_column(session_id, {"column": target}, db)
 
     eda_result = _tool_run_eda(session_id, {"target_column": target}, db)
     if "error" in eda_result: return {"step": "eda", "error": eda_result["error"]}
     prep_result = _tool_run_preprocessing(session_id, {"target_column": target}, db)
     if "error" in prep_result: return {"step": "preprocessing", "error": prep_result["error"]}
-    train_result = _tool_train_models(session_id, {"task_type": "auto"}, db)
+    train_result = _tool_train_models(
+        session_id,
+        {
+            "task_type": (
+                requested_task_type
+                if requested_task_type in {"classification", "regression"}
+                else (approved_plan or {}).get("task_type", "auto")
+            )
+        },
+        db,
+        run_id=run_id,
+    )
     if "error" in train_result: return {"step": "training", "error": train_result["error"]}
     report_result = _tool_generate_report(session_id, {}, db)
     if "error" in report_result: return {"step": "report", "error": report_result["error"]}
@@ -431,7 +672,14 @@ def _tool_rerun_pipeline(session_id: str, args: dict, db: DBSession) -> dict:
     except Exception as exc:
         logger.error("Email notification failed: %s", exc)
 
-    return {"status": "success", "target": target, "best_model": train_result.get("best_model"), "report_path": report_result.get("report_path"), "notebook_path": report_result.get("notebook_path")}
+    return {
+        "status": "success",
+        "target": target,
+        "task_type": train_result.get("task_type"),
+        "best_model": train_result.get("best_model"),
+        "report_path": report_result.get("report_path"),
+        "notebook_path": report_result.get("notebook_path"),
+    }
 
 
 # ---------- dispatcher ----------
@@ -450,13 +698,22 @@ _DISPATCH = {
 }
 
 
-def execute_tool(session_id: str, tool_name: str, arguments: dict[str, Any], db: DBSession) -> dict[str, Any]:
+def execute_tool(
+    session_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    db: DBSession,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     function = _DISPATCH.get(tool_name)
     if function is None:
         return {"ok": False, "tool": tool_name, "error": f"Unknown tool '{tool_name}'.", "error_type": "UnknownToolError"}
 
     try:
-        result = function(session_id, arguments, db)
+        if tool_name in {"train_models", "rerun_pipeline"}:
+            result = function(session_id, arguments, db, run_id=run_id)
+        else:
+            result = function(session_id, arguments, db)
         if not isinstance(result, dict):
             raise TypeError(f"Tool returned {type(result).__name__}; expected a dictionary.")
         if result.get("error"):

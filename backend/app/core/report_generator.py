@@ -55,7 +55,7 @@ HTML_TEMPLATE = """
       <li>Target column: <strong>{{ target_column }}</strong></li>
       <li>Task type: <strong>{{ task_type_en }}</strong></li>
       <li>Best model: <strong>{{ training.best_model_name }}</strong></li>
-      <li>{{ training.metric }}: <strong>{{ training.best_score|number }}</strong></li>
+      <li>Training-only CV {{ training.selection_metric }}: <strong>{{ training.cv_selection_score|number }}</strong></li>
     </ul>
   </div>
 
@@ -82,6 +82,13 @@ HTML_TEMPLATE = """
     {% endfor %}
   </table>
 
+  <h2>Key Data Quality Findings</h2>
+  {% if important_findings %}
+  <ul>{% for finding in important_findings %}<li>{{ finding }}</li>{% endfor %}</ul>
+  {% else %}
+  <p>No high-priority data quality findings were recorded.</p>
+  {% endif %}
+
   <h2>3. Exploratory Data Analysis</h2>
   {% for name in ['missing', 'numeric_dist', 'categorical_dist', 'correlation', 'outliers'] %}
     {% if name in figures %}
@@ -92,6 +99,20 @@ HTML_TEMPLATE = """
   {% endfor %}
 
   <h2>4. Target Variable Analysis</h2>
+  {% if target_profile and target_profile.task_type == 'classification' %}
+  <p>Classes: {{ target_profile.class_count }}; majority class: {{ target_profile.majority_class_percentage }}%; minority class: {{ target_profile.minority_class_percentage }}%; imbalance detected: {{ target_profile.is_imbalanced }}.</p>
+  <table>
+    <tr><th>Class</th><th>Rows</th><th>Share</th></tr>
+    {% for row in target_profile.class_distribution %}
+    <tr><td>{{ row.label }}</td><td>{{ row.count }}</td><td>{{ row.percentage }}%</td></tr>
+    {% endfor %}
+  </table>
+  {% elif target_profile and target_profile.task_type == 'regression' %}
+  <p>Target missing values: {{ target_profile.missing_count }}; potential target outliers by the 1.5×IQR rule: {{ target_profile.outlier_count }}.</p>
+  {% if target_profile.distribution_statistics %}
+  <p>Range: {{ target_profile.distribution_statistics.minimum|number }} to {{ target_profile.distribution_statistics.maximum|number }}; mean: {{ target_profile.distribution_statistics.mean|number }}; median: {{ target_profile.distribution_statistics.median|number }}; standard deviation: {{ target_profile.distribution_statistics.standard_deviation|number }}.</p>
+  {% endif %}
+  {% endif %}
   {% if 'target' in figures %}
   <div class="figure">
     <img src="data:image/png;base64,{{ figures['target'] }}" alt="Target Distribution">
@@ -113,7 +134,8 @@ HTML_TEMPLATE = """
     {% endfor %}
   </table>
 
-  <h2>6. Model Comparison Results</h2>
+  <h2>6. Cross-validation Model Comparison</h2>
+  <p class="muted">All comparison scores are averaged across cross-validation folds drawn from the training partition.</p>
   <table>
     <tr>
       <th>Model</th>
@@ -137,10 +159,24 @@ HTML_TEMPLATE = """
 
   <div class="summary-box">
     <h3>Winning Model: {{ training.best_model_name }}</h3>
-    <p>This model achieved the highest {{ training.metric }} score of <strong>{{ training.best_score|number }}</strong>.</p>
+    <p>Selected by training-only cross-validation using {{ training.selection_metric }} (mean CV score: <strong>{{ training.cv_selection_score|number }}</strong>).</p>
   </div>
 
-  <h2>7. Feature Importance (Explainable AI)</h2>
+  <h2>7. Independent Holdout Evaluation</h2>
+  {% if training.evaluation.available %}
+  <p>Method: {{ training.evaluation.method }}; holdout rows: {{ training.evaluation.test_rows }}; configured test fraction: {{ training.evaluation.test_size|number }}; random state: {{ training.evaluation.random_state }}.</p>
+  <table>
+    <tr><th>Final holdout metric</th><th>Score</th></tr>
+    {% for metric, value in training.evaluation.metrics.items() %}
+    <tr><td>{{ metric }}</td><td>{{ value|number }}</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">These metrics describe this independent holdout for this run. They are an estimate and do not guarantee performance on future data.</p>
+  {% else %}
+  <p>Independent holdout evaluation was unavailable: {{ training.evaluation.reason or 'the available data could not support a reliable holdout.' }}</p>
+  {% endif %}
+
+  <h2>8. Feature Importance (Explainable AI)</h2>
   {% if 'feature_importance' in figures %}
   <div class="figure">
     <img src="data:image/png;base64,{{ figures['feature_importance'] }}" alt="Feature Importance">
@@ -155,17 +191,17 @@ HTML_TEMPLATE = """
   {% endif %}
 
   {% if 'confusion_matrix' in figures %}
-  <h2>8. Classification Evaluation</h2>
+  <h2>9. Classification Evaluation</h2>
   <div class="figure"><img src="data:image/png;base64,{{ figures['confusion_matrix'] }}" alt="Confusion Matrix"></div>
   {% endif %}
 
   {% if 'predicted_vs_actual' in figures %}
-  <h2>8. Regression Evaluation</h2>
+  <h2>9. Regression Evaluation</h2>
   <div class="figure"><img src="data:image/png;base64,{{ figures['predicted_vs_actual'] }}" alt="Predicted vs Actual"></div>
   <div class="figure"><img src="data:image/png;base64,{{ figures['residuals'] }}" alt="Residuals"></div>
   {% endif %}
 
-  <h2>9. Recommendations</h2>
+  <h2>10. Recommendations</h2>
   <ul>{% for rec in recommendations %}<li>{{ rec }}</li>{% endfor %}</ul>
 
   <div class="footer">This report was generated automatically by AutoML Agent</div>
@@ -202,7 +238,16 @@ def generate_report(
         if _is_png_base64(value)
     }
 
+    profile = summary.get("profile") or data.get("profile")
+    profile = profile if isinstance(profile, dict) else {}
+    data.setdefault("profile", profile)
     recommendations = _recommendations(data, training, task_type)
+    target_profile = profile.get("target_info")
+    target_profile = target_profile if isinstance(target_profile, dict) else None
+    important_findings = summary.get("important_findings") or profile.get("warnings") or []
+    if not isinstance(important_findings, (list, tuple)):
+        important_findings = []
+    important_findings = [str(finding) for finding in important_findings[:10]]
     environment = Environment(autoescape=select_autoescape(["html", "xml"]))
     environment.filters["number"] = _format_number
     
@@ -212,6 +257,8 @@ def generate_report(
         target_column=target_column or "Not specified",
         task_type_en=TASK_TYPE_EN.get(task_type, task_type),
         readiness=readiness,
+        important_findings=important_findings,
+        target_profile=target_profile,
         figures=figures,
         operations=operations,
         training=training,
@@ -271,6 +318,8 @@ def _normalize_training(training: Any) -> dict[str, Any]:
     result.setdefault("best_model_name", "Unavailable")
     result.setdefault("best_score", None)
     result.setdefault("metric", "Metric")
+    result.setdefault("selection_metric", result.get("metric", "Metric"))
+    result.setdefault("cv_selection_score", result.get("best_score"))
     
     metric_names = result.get("metric_names")
     if not isinstance(metric_names, (list, tuple)):
@@ -290,6 +339,26 @@ def _normalize_training(training: Any) -> dict[str, Any]:
         normalized_rows.append(normalized)
 
     result["results"] = normalized_rows
+
+    evaluation = result.get("evaluation")
+    evaluation = dict(evaluation) if isinstance(evaluation, dict) else {}
+    evaluation["available"] = bool(evaluation.get("available", False))
+    evaluation["method"] = str(evaluation.get("method", "unavailable"))
+    try:
+        evaluation["test_size"] = float(evaluation.get("test_size"))
+    except (TypeError, ValueError, OverflowError):
+        evaluation["test_size"] = None
+    try:
+        evaluation["random_state"] = int(evaluation.get("random_state"))
+    except (TypeError, ValueError, OverflowError):
+        evaluation["random_state"] = None
+    try:
+        evaluation["test_rows"] = max(0, int(evaluation.get("test_rows", 0)))
+    except (TypeError, ValueError, OverflowError):
+        evaluation["test_rows"] = 0
+    metrics = evaluation.get("metrics")
+    evaluation["metrics"] = metrics if isinstance(metrics, dict) else {}
+    result["evaluation"] = evaluation
 
     if result["best_model_name"] is None:
         result["best_model_name"] = "Unavailable"
@@ -339,17 +408,33 @@ def _recommendations(data: dict, training: dict, task_type: str) -> list[str]:
         recommendations.append(f"Handled {data['missing_total']} missing values automatically.")
     if data.get("duplicate_rows", 0) > 0:
         recommendations.append(f"Removed {data['duplicate_rows']} duplicate rows.")
-    try:
-        best_score = float(training.get("best_score"))
-    except (TypeError, ValueError, OverflowError):
-        best_score = float("nan")
-
-    if not math.isfinite(best_score):
-        recommendations.append("Model performance could not be assessed from the available metrics.")
-    elif best_score < 0.7:
-        recommendations.append("Model performance is below 70% - consider collecting more data or feature engineering.")
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    target_profile = profile.get("target_info") if isinstance(profile, dict) else None
+    if task_type == "classification" and isinstance(target_profile, dict) and target_profile.get("is_imbalanced"):
+        operations = training.get("preprocessing_operations", [])
+        balanced = any(
+            isinstance(operation, dict)
+            and operation.get("type") == "class_imbalance_handling"
+            for operation in operations
+        )
+        if balanced:
+            recommendations.append(
+                "The training labels were imbalanced; supported candidate models used built-in class weights."
+            )
+        else:
+            recommendations.append(
+                "The target appears imbalanced; no resampling was applied, so review minority-class metrics."
+            )
+    if training.get("evaluation", {}).get("available"):
+        recommendations.append(
+            "The winning model was selected with training-only cross-validation; "
+            "review the independent holdout metrics as a separate estimate."
+        )
     else:
-        recommendations.append(f"The winning model ({training.get('best_model_name', 'Unavailable')}) achieved good performance.")
+        recommendations.append(
+            "Independent holdout evaluation was unavailable, so future performance "
+            "cannot be estimated reliably from this run."
+        )
         
     if task_type == "classification":
         recommendations.append("Try Boosting models (XGBoost/LightGBM) to potentially improve performance.")

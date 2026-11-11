@@ -5,10 +5,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.routes import analysis, artifacts, auth, chat, health, sessions, runs, predict 
-
-
-router.include_router(predict.router, prefix="/predict", tags=["predict"]) 
+from app.api.routes import analysis, artifacts, auth, chat, health, sessions, runs, predict
 
 router = APIRouter()
 
@@ -23,5 +20,5 @@ router.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
 router.include_router(chat.router, prefix="/chat", tags=["chat"])
 router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 router.include_router(analysis.router, prefix="/analysis", tags=["analysis"])
-router.include_router(runs.router, prefix="/runs", tags=["runs"]) 
-router.include_router(predict.router, prefix="/predict", tags=["predict"]) 
+router.include_router(runs.router, prefix="/runs", tags=["runs"])
+router.include_router(predict.router, prefix="/predict", tags=["predict"])

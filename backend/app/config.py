@@ -37,7 +37,7 @@ class Settings(BaseSettings):
         "postgresql+psycopg2://postgres:postgres@localhost:5433/automl"
     )
 
-    # ---------- LLM / Agent ----------
+    # ---------- Ml Pipeline / Agent ----------
     LLM_PROVIDER: str = "ollama"
     LLM_MODEL: str = "qwen3:14b"
     LLM_API_KEY: str = "ollama"
@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_TOKENS: int = 4096
     AGENT_MAX_ITERATIONS: int = 8
+    # ---------- Report Agent (LLM) ----------
+    REPORT_LLM_PROVIDER: str = "groq"
+    REPORT_LLM_MODEL: str = "openai/gpt-oss-20b"
+    REPORT_LLM_API_KEY: str = ""
 
     # ---------- Data limits ----------
     MAX_FILE_SIZE_MB: int = 200

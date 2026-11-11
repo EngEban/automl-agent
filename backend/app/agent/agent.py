@@ -140,8 +140,22 @@ async def run_agent(
                 arguments = _parse_tool_arguments(function.get("arguments"))
                 logger.info("Executing tool: %s(%s)", tool_name, arguments)
                 
-                # Run tool in threadpool to avoid Playwright sync/async clash
-                result = await run_in_threadpool(execute_tool, session_id, tool_name, arguments, db)
+                # Run tool in threadpool to avoid Playwright sync/async clash.
+                # Preserve the four-argument call for agent turns that do not
+                # have an AnalysisRun context.
+                if run_id is None:
+                    result = await run_in_threadpool(
+                        execute_tool, session_id, tool_name, arguments, db
+                    )
+                else:
+                    result = await run_in_threadpool(
+                        execute_tool,
+                        session_id,
+                        tool_name,
+                        arguments,
+                        db,
+                        run_id,
+                    )
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 result = _error_result(
                     tool_name,
