@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import pytest
+from scipy import sparse
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -141,8 +142,10 @@ def test_numeric_and_categorical_imputation_and_unseen_categories_are_safe():
     numeric = fitted["num"].named_steps["imputer"]
     categories = fitted["cat"].named_steps["encoder"].categories_[0]
 
-    assert np.isfinite(transformed_train).all()
-    assert np.isfinite(transformed_inference).all()
+    assert np.isfinite(transformed_train.data if sparse.issparse(transformed_train) else transformed_train).all()
+    assert np.isfinite(transformed_inference.data if sparse.issparse(transformed_inference) else transformed_inference).all()
+    assert sparse.issparse(transformed_train)
+    assert sparse.issparse(transformed_inference)
     assert numeric.statistics_[0] == pytest.approx(3.0)
     assert set(categories) == {"a", "b"}
     assert transformed_inference.shape[1] == transformed_train.shape[1]
@@ -157,6 +160,7 @@ def test_high_cardinality_categories_are_capped_and_reported():
     decisions = preprocessor.operations_
 
     assert transformed.shape[1] <= 50
+    assert sparse.issparse(transformed) is preprocessor.column_transformer_.sparse_output_
     assert encoder.max_categories == 50
     assert any(item["type"] == "high_cardinality_handling" for item in decisions)
     decision = next(item for item in decisions if item["type"] == "high_cardinality_handling")
@@ -199,8 +203,8 @@ def test_date_features_extract_calendar_parts_and_invalid_values_are_imputed():
 
     assert preprocessor.date_columns_ == ["event_date"]
     assert transformed_train.shape[1] == 4
-    assert np.isfinite(transformed_train).all()
-    assert np.isfinite(transformed_inference).all()
+    assert np.isfinite(transformed_train.data if sparse.issparse(transformed_train) else transformed_train).all()
+    assert np.isfinite(transformed_inference.data if sparse.issparse(transformed_inference) else transformed_inference).all()
     date_op = next(op for op in preprocessor.operations_ if op["type"] == "date_feature_extraction")
     assert date_op["features"] == ["year", "month", "day", "day_of_week"]
 
@@ -232,7 +236,7 @@ def test_holdout_mixed_dtype_cannot_change_training_feature_type():
     assert train["measurement"].dtype == object
     assert preprocessor.numeric_string_columns_ == ["measurement"]
     assert preprocessor.categorical_features_ == []
-    assert np.isfinite(transformed).all()
+    assert np.isfinite(transformed.data if sparse.issparse(transformed) else transformed).all()
 
 
 def test_preprocessing_is_compatible_with_classification_and_regression_models():
@@ -254,6 +258,22 @@ def test_preprocessing_is_compatible_with_classification_and_regression_models()
         assert len(prediction) == 1
 
 
+def test_numeric_only_preprocessing_stays_dense_and_reports_output_format():
+    frame = pd.DataFrame({"left": [1.0, 2.0, 3.0, 4.0], "right": [4.0, 2.0, 3.0, 1.0]})
+    preprocessor, _ = build_preprocessor(frame)
+
+    transformed = preprocessor.fit_transform(frame)
+
+    assert isinstance(transformed, np.ndarray)
+    output_operation = next(
+        operation
+        for operation in preprocessor.operations_
+        if operation["type"] == "encoded_matrix_format"
+    )
+    assert output_operation["format"] == "dense"
+    assert preprocessor.get_feature_names_out().tolist() == ["num__left", "num__right"]
+
+
 def test_cv_fits_preprocessing_independently_inside_each_fold(monkeypatch):
     from sklearn.base import BaseEstimator
 
@@ -267,10 +287,10 @@ def test_cv_fits_preprocessing_independently_inside_each_fold(monkeypatch):
     y = pd.Series([0, 1] * 15)
     preprocessor, _ = build_preprocessor(X)
     fit_records = []
-    original_fit = IntelligentPreprocessor.fit
+    original_fit_transform_state = IntelligentPreprocessor._fit_transform_state
 
-    def recording_fit(self, values, target=None):
-        result = original_fit(self, values, target)
+    def recording_fit_transform_state(self, values, target=None, **fit_params):
+        result = original_fit_transform_state(self, values, target, **fit_params)
         encoder = self.named_transformers_["cat"].named_steps["encoder"]
         fit_records.append({
             "row_ids": set(values["position"].astype(int)),
@@ -284,9 +304,13 @@ def test_cv_fits_preprocessing_independently_inside_each_fold(monkeypatch):
             return self
 
         def predict(self, values):
-            return np.full(len(values), self.label_)
+            return np.full(values.shape[0], self.label_)
 
-    monkeypatch.setattr(preprocessing.IntelligentPreprocessor, "fit", recording_fit)
+    monkeypatch.setattr(
+        preprocessing.IntelligentPreprocessor,
+        "_fit_transform_state",
+        recording_fit_transform_state,
+    )
     _cross_validation_metrics(
         preprocessor,
         TinyClassifier(),

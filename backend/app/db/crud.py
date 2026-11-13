@@ -12,6 +12,7 @@ from app.db.models import (
     Artifact, Experiment, Message, Operation, Session, User, ModelVersion,
     AnalysisRun, RunEvent, AnalysisPlan, DatasetSource
 )
+from app.core.run_lifecycle import transition_run_status
 
 # ==========================================
 # USER
@@ -51,6 +52,12 @@ def get_session(db: DBSession, session_id: str) -> Optional[Session]:
         return db.get(Session, session_id)
     except Exception:
         return None
+
+
+def get_session_for_update(db: DBSession, session_id: str) -> Optional[Session]:
+    """Lock a session row while creating its next run to serialize dispatch."""
+    stmt = select(Session).where(Session.id == session_id).with_for_update()
+    return db.scalars(stmt).first()
 
 def list_sessions(db: DBSession, user_id: str, limit: int = 50, offset: int = 0) -> list[Session]:
     stmt = (
@@ -159,15 +166,62 @@ def get_run(db: DBSession, run_id: str) -> Optional[AnalysisRun]:
     except Exception:
         return None
 
-def update_run(db: DBSession, run_id: str, **updates) -> Optional[AnalysisRun]:
+def update_run(
+    db: DBSession,
+    run_id: str,
+    *,
+    commit: bool = True,
+    **updates,
+) -> Optional[AnalysisRun]:
     obj = db.get(AnalysisRun, run_id)
     if obj is None:
         return None
+    new_status = updates.pop("status", None)
+    if new_status is not None:
+        transition_run_status(obj, new_status)
+    if "progress_percent" in updates:
+        requested_progress = max(0, min(100, int(updates["progress_percent"])))
+        updates["progress_percent"] = max(
+            int(obj.progress_percent or 0), requested_progress
+        )
     for key, value in updates.items():
         setattr(obj, key, value)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(obj)
     return obj
+
+
+def get_run_by_idempotency_key(
+    db: DBSession,
+    requested_by: str,
+    idempotency_key: str,
+) -> Optional[AnalysisRun]:
+    stmt = select(AnalysisRun).where(
+        AnalysisRun.requested_by == requested_by,
+        AnalysisRun.idempotency_key == idempotency_key,
+    )
+    return db.scalars(stmt).first()
+
+
+def get_active_run_for_session(
+    db: DBSession,
+    session_id: str,
+    requested_by: str,
+) -> Optional[AnalysisRun]:
+    stmt = (
+        select(AnalysisRun)
+        .where(
+            AnalysisRun.session_id == session_id,
+            AnalysisRun.requested_by == requested_by,
+            AnalysisRun.status.in_(("queued", "running", "cancelling")),
+        )
+        .order_by(AnalysisRun.created_at.desc(), AnalysisRun.id.desc())
+        .limit(1)
+    )
+    return db.scalars(stmt).first()
 
 def list_runs_for_session(db: DBSession, session_id: str) -> list[AnalysisRun]:
     stmt = (
@@ -189,18 +243,63 @@ def get_latest_run_for_session(db: DBSession, session_id: str) -> Optional[Analy
 # ==========================================
 # RUN EVENT (SSE)
 # ==========================================
-def create_event(db: DBSession, **kwargs) -> RunEvent:
+def create_event(db: DBSession, *, commit: bool = True, **kwargs) -> RunEvent:
     obj = RunEvent(**kwargs)
     db.add(obj)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(obj)
     return obj
 
+
+def get_event_for_run(db: DBSession, run_id: str, event_id: str) -> Optional[RunEvent]:
+    stmt = select(RunEvent).where(
+        RunEvent.id == event_id,
+        RunEvent.run_id == run_id,
+    )
+    return db.scalars(stmt).first()
+
+
+def list_events_after(
+    db: DBSession,
+    run_id: str,
+    *,
+    after_event_id: str | None = None,
+    limit: int = 100,
+) -> list[RunEvent]:
+    stmt = select(RunEvent).where(RunEvent.run_id == run_id)
+    if after_event_id is not None:
+        cursor = get_event_for_run(db, run_id, after_event_id)
+        if cursor is None:
+            raise ValueError("Event cursor does not belong to this run.")
+        stmt = stmt.where(RunEvent.sequence > cursor.sequence)
+    stmt = stmt.order_by(RunEvent.sequence.asc()).limit(limit)
+    return list(db.scalars(stmt))
+
+
+def list_event_page(
+    db: DBSession,
+    run_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> list[RunEvent]:
+    return list_events_after(
+        db,
+        run_id,
+        after_event_id=cursor,
+        limit=limit,
+    )
+
+
 def list_events_for_run(db: DBSession, run_id: str, limit: int = 100) -> list[RunEvent]:
+    """Compatibility helper, now ordered deterministically."""
     stmt = (
         select(RunEvent)
         .where(RunEvent.run_id == run_id)
-        .order_by(RunEvent.created_at.asc())
+        .order_by(RunEvent.sequence.asc())
         .limit(limit)
     )
     return list(db.scalars(stmt))

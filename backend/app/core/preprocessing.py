@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -39,12 +40,12 @@ def _replace_infinite_values(values):
 
 def _categorical_strings(values):
     """Normalize heterogeneous category values while preserving missingness."""
-    frame = pd.DataFrame(values).copy()
-    for column in frame.columns:
-        frame[column] = frame[column].map(
+    frame = values if isinstance(values, pd.DataFrame) else pd.DataFrame(values)
+    return frame.apply(
+        lambda column: column.map(
             lambda value: np.nan if pd.isna(value) else str(value)
         )
-    return frame
+    )
 
 
 def prepare_xy(
@@ -77,9 +78,8 @@ def prepare_xy_for_training(
     """Prepare rows without fitting a target-label mapping before the split."""
     validate_target_column(df, target)
     operations: list[dict[str, Any]] = []
-    cleaned = df.copy()
-    before = len(cleaned)
-    cleaned = cleaned.dropna(subset=[target]).reset_index(drop=True)
+    before = len(df)
+    cleaned = df.dropna(subset=[target]).reset_index(drop=True)
     dropped = before - len(cleaned)
     if dropped:
         operations.append({"type": "drop_missing_target", "count": dropped})
@@ -87,7 +87,7 @@ def prepare_xy_for_training(
     if duplicates:
         cleaned = cleaned.drop_duplicates().reset_index(drop=True)
         operations.append({"type": "drop_duplicates", "count": duplicates})
-    return cleaned.drop(columns=[target]), cleaned[target].copy(), operations
+    return cleaned.drop(columns=[target]), cleaned[target], operations
 
 
 def _is_categorical(series: pd.Series) -> bool:
@@ -140,7 +140,9 @@ class IntelligentPreprocessor(BaseEstimator, TransformerMixin):
 
     def _as_frame(self, X) -> pd.DataFrame:
         if isinstance(X, pd.DataFrame):
-            frame = X.copy()
+            if list(X.columns) == list(self.feature_columns):
+                return X
+            return X.reindex(columns=self.feature_columns)
         else:
             frame = pd.DataFrame(X, columns=self.feature_columns)
         for column in self.feature_columns:
@@ -168,7 +170,7 @@ class IntelligentPreprocessor(BaseEstimator, TransformerMixin):
                 output[str(column)] = values
         return pd.DataFrame(output, index=frame.index)
 
-    def fit(self, X, y=None):
+    def _fit_transform_state(self, X, y=None, **fit_params):
         frame = self._as_frame(X)
         self.n_features_in_ = len(self.feature_columns)
         self.feature_names_in_ = np.asarray(self.feature_columns, dtype=object)
@@ -254,7 +256,7 @@ class IntelligentPreprocessor(BaseEstimator, TransformerMixin):
                 ("imputer", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),
                 ("encoder", OneHotEncoder(
                     handle_unknown="infrequent_if_exist",
-                    sparse_output=False,
+                    sparse_output=True,
                     min_frequency=self.rare_threshold,
                     max_categories=self.max_categories,
                 )),
@@ -263,10 +265,28 @@ class IntelligentPreprocessor(BaseEstimator, TransformerMixin):
         if not transformers:
             raise ValueError("No supported feature columns remain after preprocessing decisions.")
 
-        self.column_transformer_ = ColumnTransformer(transformers, remainder="drop")
-        self.column_transformer_.fit(expanded, y)
+        self.column_transformer_ = ColumnTransformer(
+            transformers, remainder="drop", sparse_threshold=1.0
+        )
+        transformed = self.column_transformer_.fit_transform(expanded, y, **fit_params)
         self.operations_ = self._fitted_operations(frame)
+        self.operations_.append({
+            "type": "encoded_matrix_format",
+            "format": (
+                f"{transformed.format.upper()} sparse"
+                if sparse.issparse(transformed)
+                else "dense"
+            ),
+            "reason": "Sparse output is retained when it reduces preprocessing memory.",
+        })
+        return transformed
+
+    def fit(self, X, y=None):
+        self._fit_transform_state(X, y)
         return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        return self._fit_transform_state(X, y, **fit_params)
 
     def transform(self, X):
         if not hasattr(self, "column_transformer_"):

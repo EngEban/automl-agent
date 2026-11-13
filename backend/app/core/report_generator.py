@@ -69,6 +69,16 @@ HTML_TEMPLATE = """
     <tr><td>Categorical columns</td><td>{{ data.categorical_columns|length }}</td></tr>
   </table>
 
+  {% if data.loading_metadata and data.loading_metadata.original_row_count is not none %}
+  <h2>Dataset Loading and Sampling</h2>
+  <p>Source rows: {{ data.loading_metadata.original_row_count }}; loaded rows: {{ data.loading_metadata.loaded_row_count }}.</p>
+  {% if data.loading_metadata.sampling_applied %}
+  <p>A deterministic {{ data.loading_metadata.sampling_method }} sample was used (limit {{ data.loading_metadata.sampling_limit }} rows, seed {{ data.loading_metadata.sampling_seed }}{% if data.loading_metadata.chunk_size %}, CSV chunk size {{ data.loading_metadata.chunk_size }}{% endif %}). Profiling and EDA statistics in this report describe the loaded sample; some rare categories or target classes may not appear.</p>
+  {% else %}
+  <p>No sampling was applied. Profiling and EDA statistics describe all parsed source rows.</p>
+  {% endif %}
+  {% endif %}
+
   <h2>2. Data Readiness Assessment</h2>
   <table>
     <tr><th>Requirement</th><th>Status</th></tr>
@@ -188,6 +198,23 @@ HTML_TEMPLATE = """
   </p>
   {% else %}
   <p class="muted">Feature importance could not be calculated for this run (e.g., due to small dataset size).</p>
+  {% endif %}
+
+  <h2>Memory and Processing</h2>
+  {% if training.memory_summary.source_dataset %}
+  <p>Input dataset memory is approximately {{ training.memory_summary.source_dataset.megabytes }} MiB across {{ training.memory_summary.source_dataset.rows }} rows and {{ training.memory_summary.source_dataset.columns }} columns.</p>
+  {% if training.memory_summary.dataset_warning %}
+  <p class="muted">The input dataset exceeds the configured memory warning threshold of {{ training.memory_summary.dataset_warning_threshold_mb }} MiB.</p>
+  {% endif %}
+  {% endif %}
+  {% if training.memory_summary.feature_frame_warning %}
+  <p class="muted">The feature frame also exceeds the configured dataset memory warning threshold before encoding.</p>
+  {% endif %}
+  <p>Fitted preprocessing produced {{ training.memory_summary.encoded_matrix_format }} output. Dense conversions are limited to {{ training.memory_summary.dense_conversion_limit_mb }} MiB; the selected model {% if training.memory_summary.dense_only_estimator %}requires guarded dense input{% else %}accepts sparse input{% endif %}.</p>
+  <p>Prediction requests are processed in batches of up to {{ training.memory_summary.prediction_batch_size }} rows. Dataset loading and training still keep the working dataset in memory.</p>
+  {% if training.failures %}
+  <p>Some candidate models could not be evaluated:</p>
+  <ul>{% for failure in training.failures[:5] %}<li>{{ failure.model }}: {{ failure.error }}</li>{% endfor %}</ul>
   {% endif %}
 
   {% if 'confusion_matrix' in figures %}
@@ -310,6 +337,23 @@ def _normalize_data(data: Any) -> dict[str, Any]:
         except (TypeError, ValueError, OverflowError):
             result[key] = 0
 
+    loading_metadata = result.get("loading_metadata")
+    if isinstance(loading_metadata, dict):
+        loading_metadata = dict(loading_metadata)
+        for key in ("original_row_count", "loaded_row_count", "sampling_limit", "chunk_size"):
+            value = loading_metadata.get(key)
+            if value is not None:
+                try:
+                    loading_metadata[key] = max(0, int(value))
+                except (TypeError, ValueError, OverflowError):
+                    loading_metadata[key] = None
+        loading_metadata["sampling_applied"] = bool(
+            loading_metadata.get("sampling_applied", False)
+        )
+        result["loading_metadata"] = loading_metadata
+    else:
+        result["loading_metadata"] = {}
+
     return result
 
 
@@ -359,6 +403,30 @@ def _normalize_training(training: Any) -> dict[str, Any]:
     metrics = evaluation.get("metrics")
     evaluation["metrics"] = metrics if isinstance(metrics, dict) else {}
     result["evaluation"] = evaluation
+
+    memory_summary = result.get("memory_summary")
+    memory_summary = dict(memory_summary) if isinstance(memory_summary, dict) else {}
+    source_memory = memory_summary.get("source_dataset")
+    memory_summary["source_dataset"] = (
+        dict(source_memory) if isinstance(source_memory, dict) else {}
+    )
+    memory_summary.setdefault("encoded_matrix_format", "unavailable")
+    memory_summary.setdefault("dense_conversion_limit_mb", "unavailable")
+    memory_summary.setdefault("prediction_batch_size", "unavailable")
+    memory_summary.setdefault("dense_only_estimator", False)
+    memory_summary.setdefault("dataset_warning", False)
+    memory_summary.setdefault("dataset_warning_threshold_mb", "unavailable")
+    result["memory_summary"] = memory_summary
+
+    failures = result.get("failures")
+    result["failures"] = [
+        {
+            "model": str(item.get("model", "Unknown model")),
+            "error": str(item.get("error", "No additional details."))[:500],
+        }
+        for item in failures[:20]
+        if isinstance(item, dict)
+    ] if isinstance(failures, (list, tuple)) else []
 
     if result["best_model_name"] is None:
         result["best_model_name"] = "Unavailable"

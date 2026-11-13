@@ -7,11 +7,15 @@ from __future__ import annotations
 import io
 import ipaddress
 import logging
+import random
 import socket
+import tempfile
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -49,49 +53,209 @@ def _detect_format(source: str) -> str:
     return ".csv"
 
 
-def _read_bytes(content: bytes, fmt: str) -> pd.DataFrame:
-    """Read a DataFrame from raw bytes based on format."""
-    buffer = io.BytesIO(content)
+def _positive_integer_setting(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+        raise DataLoadError(
+            f"Invalid configuration: {name} must be a positive integer."
+        )
+    return int(value)
+
+
+def _sampling_seed() -> int:
+    seed = settings.RANDOM_STATE
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise DataLoadError("Invalid configuration: RANDOM_STATE must be an integer.")
+    return int(seed)
+
+
+def _read_csv_chunked(source, sep: str = ",") -> pd.DataFrame:
+    """Parse CSV chunks and retain a deterministic uniform reservoir sample."""
+    sample_limit = _positive_integer_setting(
+        "MAX_ROWS_SAMPLE", settings.MAX_ROWS_SAMPLE
+    )
+    chunk_size = _positive_integer_setting("CSV_CHUNK_SIZE", settings.CSV_CHUNK_SIZE)
+    if chunk_size > 1_000_000:
+        raise DataLoadError(
+            "Invalid configuration: CSV_CHUNK_SIZE cannot exceed 1,000,000 rows."
+        )
+    seed = _sampling_seed()
+
+    random_source = random.Random(int(seed))
+    reservoir: list[tuple[int, tuple[Any, ...]]] = []
+    columns: list[Any] | None = None
+    dtype_kinds: list[set[str]] = []
+    source_non_null: np.ndarray | None = None
+    source_rows = 0
     try:
-        if fmt == ".csv":
-            return pd.read_csv(buffer)
-        if fmt == ".tsv":
-            return pd.read_csv(buffer, sep="\t")
+        with pd.read_csv(source, sep=sep, chunksize=chunk_size) as reader:
+            for chunk in reader:
+                if columns is None:
+                    columns = list(chunk.columns)
+                    dtype_kinds = [set() for _ in columns]
+                    source_non_null = np.zeros(len(columns), dtype=bool)
+                elif list(chunk.columns) != columns:
+                    raise DataLoadError(
+                        "CSV column headers changed between chunks; the file cannot be loaded safely."
+                    )
+
+                if len(columns or ()):
+                    chunk_non_null = chunk.notna().any(axis=0).to_numpy(dtype=bool)
+                    source_non_null |= chunk_non_null
+                    for position, dtype in enumerate(chunk.dtypes):
+                        dtype_kinds[position].add(getattr(dtype, "kind", "O"))
+
+                for row_values in chunk.itertuples(index=False, name=None):
+                    source_position = source_rows
+                    if source_rows < sample_limit:
+                        reservoir.append((source_position, row_values))
+                    else:
+                        replacement = random_source.randrange(source_rows + 1)
+                        if replacement < sample_limit:
+                            reservoir[replacement] = (source_position, row_values)
+                    source_rows += 1
+                # Do not keep a completed parser chunk alive while reading the next.
+                chunk = None
+
+        if source_rows == 0:
+            raise DataLoadError("CSV contains headers but no data rows.")
+        if columns is None:
+            raise DataLoadError("CSV file is empty or has no header row.")
+
+        reservoir.sort(key=lambda item: item[0])
+        sample_records = [values for _, values in reservoir]
+        sampled = pd.DataFrame.from_records(
+            sample_records, columns=columns
+        )
+        reservoir.clear()
+        del sample_records
+        numeric_kinds = {"i", "u", "f"}
+        dtype_fallback = []
+        for position, kinds in enumerate(dtype_kinds):
+            preserve_object = (
+                not kinds
+                or not kinds.issubset(numeric_kinds | {"b"})
+                or ("b" in kinds and len(kinds) > 1)
+                or ("i" in kinds and "u" in kinds)
+            )
+            promote_float = kinds.issubset(numeric_kinds) and "f" in kinds
+            if preserve_object or promote_float:
+                values = sampled.iloc[:, position]
+                if preserve_object and values.dtype != object:
+                    dtype_fallback.append((position, values.astype(object)))
+                elif promote_float and not pd.api.types.is_float_dtype(values.dtype):
+                    dtype_fallback.append(
+                        (position, pd.to_numeric(values).astype(float))
+                    )
+        if hasattr(sampled, "isetitem"):
+            for position, values in dtype_fallback:
+                sampled.isetitem(position, values)
+        elif dtype_fallback:
+            rebuilt = [sampled.iloc[:, position] for position in range(sampled.shape[1])]
+            for position, values in dtype_fallback:
+                rebuilt[position] = values
+            sampled = pd.concat(rebuilt, axis=1)
+            sampled.columns = columns
+
+        sampled.attrs["_source_non_null_mask"] = (
+            source_non_null.tolist() if source_non_null is not None else []
+        )
+        sampled.attrs["loading_metadata"] = {
+            "original_row_count": int(source_rows),
+            "loaded_row_count": int(len(sampled)),
+            "sampling_applied": source_rows > sample_limit,
+            "sampling_limit": sample_limit,
+            "sampling_method": "reservoir" if source_rows > sample_limit else "none",
+            "sampling_seed": int(seed),
+            "chunk_size": chunk_size,
+        }
+        return sampled
+    except DataLoadError:
+        raise
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeError, ValueError) as exc:
+        raise DataLoadError(f"Failed to read CSV data: {exc}") from exc
+    except Exception as exc:
+        raise DataLoadError(f"Failed to read CSV data: {exc}") from exc
+
+
+def _read_source(source, fmt: str) -> pd.DataFrame:
+    """Read one supported source, chunking CSV/TSV and preserving other readers."""
+    if fmt == ".csv":
+        return _read_csv_chunked(source)
+    if fmt == ".tsv":
+        return _read_csv_chunked(source, sep="\t")
+    try:
         if fmt in (".xlsx", ".xls"):
-            return pd.read_excel(buffer)
+            return pd.read_excel(source)
         if fmt == ".json":
-            return pd.read_json(buffer)
+            return pd.read_json(source)
         if fmt == ".jsonl":
-            return pd.read_json(buffer, lines=True)
+            return pd.read_json(source, lines=True)
     except Exception as exc:
         raise DataLoadError(f"Failed to read data ({fmt}): {exc}") from exc
     raise DataLoadError(f"Unsupported format: {fmt}")
 
 
+def _read_bytes(content: bytes, fmt: str) -> pd.DataFrame:
+    """Read raw bytes through the same format-specific loader as local files."""
+    return _read_source(io.BytesIO(content), fmt)
+
+
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize column names."""
-    df = df.copy()
+    # Renaming the axis does not mutate the caller's frame; a shallow view
+    # avoids copying every loaded cell solely to normalize column names.
+    df = df.copy(deep=False)
     df.columns = [str(c).strip().replace(" ", "_") for c in df.columns]
     return df
 
 
 def _post_process(df: pd.DataFrame, source: str) -> pd.DataFrame:
     """Light cleaning after loading."""
+    loading_metadata = dict(df.attrs.get("loading_metadata", {}))
+    source_non_null_mask = df.attrs.get("_source_non_null_mask")
+    sample_limit = _positive_integer_setting(
+        "MAX_ROWS_SAMPLE", settings.MAX_ROWS_SAMPLE
+    )
+    original_row_count = int(loading_metadata.get("original_row_count", len(df)))
     if df.empty:
         raise DataLoadError("Dataset is empty.")
 
     df = _clean_columns(df)
-    df = df.dropna(axis=1, how="all")
+    if isinstance(source_non_null_mask, list) and len(source_non_null_mask) == df.shape[1]:
+        keep_columns = [
+            position
+            for position, is_non_null in enumerate(source_non_null_mask)
+            if is_non_null
+        ]
+        if len(keep_columns) != df.shape[1]:
+            df = df.iloc[:, keep_columns]
+    else:
+        df = df.dropna(axis=1, how="all")
 
-    if len(df) > settings.MAX_ROWS_SAMPLE:
-        logger.info("Sampling %d rows from %d", settings.MAX_ROWS_SAMPLE, len(df))
-        df = df.sample(
-            n=settings.MAX_ROWS_SAMPLE,
-            random_state=settings.RANDOM_STATE,
-        ).reset_index(drop=True)
+    if not loading_metadata and len(df) > sample_limit:
+        logger.info("Sampling %d rows from %d", sample_limit, len(df))
+        selected_positions = sorted(
+            random.Random(_sampling_seed()).sample(range(len(df)), sample_limit)
+        )
+        df = df.iloc[selected_positions].reset_index(drop=True)
 
     for col in df.select_dtypes(include="object").columns:
         df[col] = df[col].astype(str).str.strip().replace({"nan": None, "": None})
+
+    if not loading_metadata:
+        sampled = original_row_count > sample_limit
+        loading_metadata = {
+            "original_row_count": original_row_count,
+            "loaded_row_count": int(len(df)),
+            "sampling_applied": sampled,
+            "sampling_limit": sample_limit,
+            "sampling_method": "uniform_random_sample" if sampled else "none",
+            "sampling_seed": _sampling_seed(),
+            "chunk_size": None,
+        }
+    else:
+        loading_metadata["loaded_row_count"] = int(len(df))
+    df.attrs["loading_metadata"] = loading_metadata
 
     logger.info("Loaded %s: shape=%s", source, df.shape)
     return df
@@ -110,67 +274,69 @@ def load_from_url(url: str) -> pd.DataFrame:
     """Load a DataFrame from a URL after SSRF and size checks."""
     max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
     current_url = url
-    content = bytearray()
-
-    for redirect_number in range(MAX_REDIRECTS + 1):
-        _validate_remote_url(current_url)
-        response = None
-        try:
-            # Redirects are handled manually so every destination is checked.
-            response = requests.get(
-                current_url,
-                timeout=60,
-                stream=True,
-                allow_redirects=False,
-            )
-
-            if response.status_code in {301, 302, 303, 307, 308}:
-                location = (
-                    response.headers.get("Location")
-                    or response.headers.get("location")
+    with tempfile.TemporaryFile(mode="w+b") as content:
+        downloaded_bytes = 0
+        for redirect_number in range(MAX_REDIRECTS + 1):
+            _validate_remote_url(current_url)
+            response = None
+            try:
+                # Redirects are handled manually so every destination is checked.
+                response = requests.get(
+                    current_url,
+                    timeout=60,
+                    stream=True,
+                    allow_redirects=False,
                 )
-                if not location:
-                    raise DataLoadError("URL redirect did not provide a destination.")
-                if redirect_number >= MAX_REDIRECTS:
-                    raise DataLoadError("Too many URL redirects.")
-                current_url = urljoin(current_url, location)
-                continue
 
-            response.raise_for_status()
-            content_length = (
-                response.headers.get("Content-Length")
-                or response.headers.get("content-length")
-            )
-            if content_length:
-                try:
-                    if int(content_length) > max_bytes:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = (
+                        response.headers.get("Location")
+                        or response.headers.get("location")
+                    )
+                    if not location:
+                        raise DataLoadError("URL redirect did not provide a destination.")
+                    if redirect_number >= MAX_REDIRECTS:
+                        raise DataLoadError("Too many URL redirects.")
+                    current_url = urljoin(current_url, location)
+                    continue
+
+                response.raise_for_status()
+                content_length = (
+                    response.headers.get("Content-Length")
+                    or response.headers.get("content-length")
+                )
+                if content_length:
+                    try:
+                        if int(content_length) > max_bytes:
+                            raise DataLoadError(
+                                f"File exceeds {settings.MAX_FILE_SIZE_MB} MB."
+                            )
+                    except ValueError:
+                        logger.warning("Ignoring invalid Content-Length header from %s", current_url)
+
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    downloaded_bytes += len(chunk)
+                    if downloaded_bytes > max_bytes:
                         raise DataLoadError(
                             f"File exceeds {settings.MAX_FILE_SIZE_MB} MB."
                         )
-                except ValueError:
-                    logger.warning("Ignoring invalid Content-Length header from %s", current_url)
+                    content.write(chunk)
+                break
+            except DataLoadError:
+                raise
+            except requests.RequestException as exc:
+                raise DataLoadError(f"Failed to download URL: {exc}") from exc
+            finally:
+                if response is not None:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
 
-            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                if not chunk:
-                    continue
-                content.extend(chunk)
-                if len(content) > max_bytes:
-                    raise DataLoadError(
-                        f"File exceeds {settings.MAX_FILE_SIZE_MB} MB."
-                    )
-            break
-        except DataLoadError:
-            raise
-        except requests.RequestException as exc:
-            raise DataLoadError(f"Failed to download URL: {exc}") from exc
-        finally:
-            if response is not None:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-
-    fmt = _detect_format(current_url)
-    df = _read_bytes(bytes(content), fmt)
+        fmt = _detect_format(current_url)
+        content.seek(0)
+        df = _read_source(content, fmt)
     return _post_process(df, source=url)
 
 
@@ -233,20 +399,26 @@ def _is_blocked_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bo
     )
 
 
-def load_from_path(path: str | Path) -> pd.DataFrame:
+def load_from_path(path: str | Path, format_hint: str | None = None) -> pd.DataFrame:
     """Load a DataFrame from a local path (used in tests)."""
     p = Path(path)
     if not p.exists():
         raise DataLoadError(f"File not found: {p}")
     if p.stat().st_size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
         raise DataLoadError("File too large.")
-    df = _read_bytes(p.read_bytes(), p.suffix.lower())
+    fmt = (format_hint or p.suffix).lower()
+    if fmt and not fmt.startswith("."):
+        fmt = f".{fmt}"
+    if fmt not in SUPPORTED_EXTENSIONS:
+        raise DataLoadError(f"Unsupported extension: {fmt}")
+    with p.open("rb") as source:
+        df = _read_source(source, fmt)
     return _post_process(df, source=str(p))
 
 
 def describe(df: pd.DataFrame) -> dict[str, Any]:
     """Structural description of the loaded data."""
-    return {
+    description = {
         "n_rows": int(df.shape[0]),
         "n_columns": int(df.shape[1]),
         "columns": list(df.columns),
@@ -259,3 +431,7 @@ def describe(df: pd.DataFrame) -> dict[str, Any]:
         },
         "duplicate_rows": int(df.duplicated().sum()),
     }
+    loading_metadata = df.attrs.get("loading_metadata")
+    if isinstance(loading_metadata, dict):
+        description["loading_metadata"] = dict(loading_metadata)
+    return description

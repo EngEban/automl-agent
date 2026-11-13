@@ -151,6 +151,7 @@ def generate_notebook(
     imports = """import os
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from IPython.display import display
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
@@ -171,7 +172,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 print("Libraries imported successfully.")
@@ -256,7 +257,7 @@ numeric_transformer = Pipeline(steps=[
 
 categorical_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),
-    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=0.05, max_categories=50)),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=True, min_frequency=0.05, max_categories=50)),
 ])
 
 transformers = []
@@ -264,13 +265,36 @@ if numeric_features: transformers.append(("num", numeric_transformer, numeric_fe
 if categorical_features: transformers.append(("cat", categorical_transformer, categorical_features))
 if not transformers: raise ValueError("No supported feature columns remain.")
 
-preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+preprocessor = ColumnTransformer(transformers=transformers, remainder="drop", sparse_threshold=1.0)
 print("Preprocessor built successfully.")
 """
 
+    input_adapter = (
+        "safe_dense_input"
+        if best_model_name == "HistGradientBoosting"
+        else "passthrough"
+    )
+    max_dense_conversion_mb = int(settings.MAX_DENSE_CONVERSION_MB)
     training = f"""# 4. Define and train the winning model
 model = {model_code}
-pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
+MAX_DENSE_CONVERSION_MB = {max_dense_conversion_mb}
+def safe_dense_input(values):
+    if not sparse.issparse(values):
+        return values
+    required_bytes = int(values.shape[0]) * int(values.shape[1]) * np.dtype(values.dtype).itemsize
+    if required_bytes > MAX_DENSE_CONVERSION_MB * 1024 * 1024:
+        raise MemoryError(
+            f"Dense conversion needs {{required_bytes / (1024 ** 2):.1f}} MiB; "
+            f"the limit is {{MAX_DENSE_CONVERSION_MB}} MiB. Use a sparse-compatible "
+            "model or reduce rows/features before training."
+        )
+    return values.toarray()
+
+pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("model_input", FunctionTransformer(safe_dense_input, accept_sparse=True) if {input_adapter!r} == "safe_dense_input" else "passthrough"),
+    ("model", model),
+])
 pipeline.fit(X_train, y_train)
 print("Model trained successfully.")
 """

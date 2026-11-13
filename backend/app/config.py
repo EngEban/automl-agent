@@ -3,6 +3,7 @@ Application configuration.
 Values are read from environment variables (or a .env file).
 """
 from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -44,21 +45,52 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str | None = None
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_TOKENS: int = 4096
-    AGENT_MAX_ITERATIONS: int = 8
-    # ---------- Report Agent (LLM) ----------
+    AGENT_MAX_ITERATIONS: int = Field(default=8, gt=0, le=32)
+    AGENT_MAX_TOOL_CALLS: int = Field(default=12, gt=0, le=64)
+    AGENT_LLM_TIMEOUT_SECONDS: int = Field(default=120, gt=0, le=600)
+    AGENT_TOOL_TIMEOUT_SECONDS: int = Field(default=600, gt=0, le=3600)
+    # ---------- Report Agent (Groq) ----------
     REPORT_LLM_PROVIDER: str = "groq"
     REPORT_LLM_MODEL: str = "openai/gpt-oss-20b"
     REPORT_LLM_API_KEY: str = ""
+    REPORT_AGENT_ENABLED: bool = False
+    REPORT_LLM_MAX_TOKENS: int = Field(default=4096, gt=0, le=16_000)
+    REPORT_LLM_TIMEOUT_SECONDS: int = Field(default=90, gt=0, le=600)
 
     # ---------- Data limits ----------
     MAX_FILE_SIZE_MB: int = 200
-    MAX_ROWS_SAMPLE: int = 100_000
+    MAX_ROWS_SAMPLE: int = Field(
+        default=100_000,
+        gt=0,
+        description="Maximum loaded data rows per dataset after deterministic sampling.",
+    )
+    CSV_CHUNK_SIZE: int = Field(
+        default=10_000,
+        gt=0,
+        le=1_000_000,
+        description="Rows read per CSV parser chunk while loading and sampling.",
+    )
+    DATASET_MEMORY_WARNING_MB: int = Field(
+        default=512,
+        gt=0,
+        description="Warn when the deep pandas estimate for a dataset exceeds this many MiB.",
+    )
 
     # ---------- ML ----------
     RANDOM_STATE: int = 42
     TEST_SIZE: float = 0.2
     VALIDATION_SIZE: float = 0.1
     MAX_CANDIDATE_MODELS: int = 5
+    MAX_DENSE_CONVERSION_MB: int = Field(
+        default=512,
+        gt=0,
+        description="Maximum estimated size of a single sparse-to-dense conversion in MiB.",
+    )
+    PREDICTION_BATCH_SIZE: int = Field(
+        default=256,
+        gt=0,
+        description="Maximum number of records transformed together during prediction.",
+    )
 
     # ---------- App Settings ----------
     APP_NAME: str = "AutoML Agent"

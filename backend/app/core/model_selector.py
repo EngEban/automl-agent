@@ -39,6 +39,7 @@ class ModelSpec:
     requires_scaling: bool
     supports_multiclass: bool
     is_fast: bool
+    supports_sparse_input: bool = True
 
 
 # ==========================================
@@ -77,6 +78,7 @@ MODEL_REGISTRY: dict[str, list[ModelSpec]] = {
             requires_scaling=False,
             supports_multiclass=True,
             is_fast=True,
+            supports_sparse_input=False,
         ),
         ModelSpec(
             name="GradientBoosting",
@@ -127,6 +129,7 @@ MODEL_REGISTRY: dict[str, list[ModelSpec]] = {
             requires_scaling=False,
             supports_multiclass=False,
             is_fast=True,
+            supports_sparse_input=False,
         ),
         ModelSpec(
             name="GradientBoosting",
@@ -140,14 +143,22 @@ MODEL_REGISTRY: dict[str, list[ModelSpec]] = {
 }
 
 _SCALING_REQUIREMENTS: dict[type, bool] = {}
+_SPARSE_INPUT_SUPPORT: dict[type, bool] = {}
 for _model_specs in MODEL_REGISTRY.values():
     for _model_spec in _model_specs:
-        _SCALING_REQUIREMENTS[type(_model_spec.factory())] = _model_spec.requires_scaling
+        _model_type = type(_model_spec.factory())
+        _SCALING_REQUIREMENTS[_model_type] = _model_spec.requires_scaling
+        _SPARSE_INPUT_SUPPORT[_model_type] = _model_spec.supports_sparse_input
 
 
 def model_requires_scaling(model: Any) -> bool:
     """Return the registered preprocessing requirement for a candidate estimator."""
     return _SCALING_REQUIREMENTS.get(type(model), False)
+
+
+def model_supports_sparse_input(model: Any) -> bool:
+    """Return sparse-input capability recorded for a registered estimator."""
+    return _SPARSE_INPUT_SUPPORT.get(type(model), True)
 
 
 _TARGET_NAME_SIGNALS = {

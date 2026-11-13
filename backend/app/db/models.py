@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, String, Text, func,
+    JSON, Boolean, DateTime, ForeignKey, Index, String, Text, func,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -103,6 +103,14 @@ class Artifact(Base):
 
 class AnalysisRun(Base):
     __tablename__ = "analysis_runs"
+    __table_args__ = (
+        Index(
+            "uq_analysis_runs_owner_idempotency",
+            "requested_by",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     session_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -137,9 +145,13 @@ class AnalysisRun(Base):
 
 class RunEvent(Base):
     __tablename__ = "run_events"
+    __table_args__ = (
+        Index("uq_run_events_run_sequence", "run_id", "sequence", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     run_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("analysis_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(nullable=False)
     
     # event_type: run.started, step.started, step.progress, run.succeeded, run.failed, run.cancelled
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)

@@ -14,14 +14,18 @@ class AnalysisRunRead(BaseModel):
     progress_percent: int
     message: Optional[str]
     error_message: Optional[str]
+    error_code: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
 class RunEventRead(BaseModel):
     id: str
     run_id: str
+    sequence: int
     event_type: str
     step: Optional[str]
     progress_percent: int

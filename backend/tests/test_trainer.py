@@ -15,6 +15,7 @@ from sklearn.tree import DecisionTreeClassifier
 from app.agent import executor
 from app.core import trainer
 from app.core import code_generator
+from app.core.memory import DenseConversionLimitError
 from app.core.preprocessing import build_preprocessor
 from app.core.report_generator import _normalize_training
 
@@ -164,7 +165,7 @@ def test_optuna_trials_only_receive_training_partition(monkeypatch):
     train_ids_seen = []
     cv_models = []
 
-    def fake_cv(_prep, model, X_cv, _y_cv, _task, _splitter):
+    def fake_cv(_prep, model, X_cv, _y_cv, _task, _splitter, projected_rows=None):
         rows = tuple(X_cv["row_id"].astype(int))
         train_ids_seen.append(rows)
         cv_models.append(model)
@@ -312,6 +313,107 @@ def test_model_registry_scaling_and_training_only_class_weight_decisions():
     )
     assert regressors[0][1].get_params() == LinearRegression().get_params()
     assert regression_operation is None
+
+
+def test_dense_only_model_is_stopped_by_preflight_before_sparse_conversion(monkeypatch):
+    frame = pd.DataFrame({
+        "number": np.arange(20, dtype=float),
+        "group": ["a", "b"] * 10,
+    })
+    preprocessor, _ = build_preprocessor(frame)
+    pipeline = trainer._pipeline(
+        preprocessor,
+        HistGradientBoostingClassifier(random_state=0),
+        projected_rows=len(frame),
+    )
+    monkeypatch.setattr("app.core.memory.settings.MAX_DENSE_CONVERSION_MB", 0.0001)
+
+    with pytest.raises(DenseConversionLimitError, match="configured limit"):
+        pipeline.fit(frame, np.array([0, 1] * 10))
+
+
+def test_sparse_compatible_pipeline_receives_sparse_input():
+    from scipy import sparse
+
+    class SparseInputRecorder(BaseEstimator):
+        def fit(self, values, labels):
+            self.received_sparse_ = sparse.issparse(values)
+            self.label_ = int(pd.Series(labels).mode().iloc[0])
+            return self
+
+        def predict(self, values):
+            return np.full(values.shape[0], self.label_)
+
+    frame = pd.DataFrame({
+        "number": np.arange(12, dtype=float),
+        "group": ["a", "b"] * 6,
+    })
+    preprocessor, _ = build_preprocessor(frame)
+    pipeline = trainer._pipeline(preprocessor, SparseInputRecorder())
+    pipeline.fit(frame, np.array([0, 1] * 6))
+
+    assert pipeline.named_steps["model"].received_sparse_ is True
+
+
+def test_dense_candidate_is_skipped_when_sparse_candidate_is_safe(monkeypatch):
+    frame = pd.DataFrame({
+        "number": np.arange(40, dtype=float),
+        "group": ["a", "b"] * 20,
+    })
+    target = pd.Series([0, 1] * 20, name="target")
+    monkeypatch.setattr(
+        trainer,
+        "get_candidate_models",
+        lambda *_args, **_kwargs: [
+            ("HistGradientBoosting", HistGradientBoostingClassifier(random_state=0)),
+            ("LogisticRegression", LogisticRegression(max_iter=300)),
+        ],
+    )
+    monkeypatch.setattr("app.core.memory.settings.MAX_DENSE_CONVERSION_MB", 0.0001)
+    monkeypatch.setattr(trainer, "_plot_confusion_matrix", lambda *_: "confusion")
+    monkeypatch.setattr(trainer, "_importance_chart", lambda *_: "importance")
+    monkeypatch.setattr(trainer, "_comparison_chart", lambda *_: "comparison")
+    monkeypatch.setattr(
+        trainer,
+        "permutation_importance",
+        lambda _estimator, values, *_args, **_kwargs: SimpleNamespace(
+            importances_mean=np.zeros(values.shape[1])
+        ),
+    )
+
+    result = trainer.train_and_evaluate(
+        frame, target, build_preprocessor(frame)[0], "classification"
+    )
+
+    assert result["best_model_name"] == "LogisticRegression"
+    assert result["failures"][0]["model"] == "HistGradientBoosting"
+    assert "MAX_DENSE_CONVERSION_MB" in result["failures"][0]["error"]
+
+
+def test_training_stops_clearly_when_every_candidate_needs_unsafe_dense_input(
+    monkeypatch,
+):
+    frame = pd.DataFrame({
+        "number": np.arange(40, dtype=float),
+        "group": ["a", "b"] * 20,
+    })
+    target = pd.Series([0, 1] * 20, name="target")
+    monkeypatch.setattr(
+        trainer,
+        "get_candidate_models",
+        lambda *_args, **_kwargs: [
+            ("HistGradientBoosting", HistGradientBoostingClassifier(random_state=0))
+        ],
+    )
+    monkeypatch.setattr("app.core.memory.settings.MAX_DENSE_CONVERSION_MB", 0.0001)
+
+    with pytest.raises(
+        RuntimeError,
+        match="No candidate could be trained safely.*MAX_DENSE_CONVERSION_MB",
+    ):
+        trainer.train_and_evaluate(
+            frame, target, build_preprocessor(frame)[0], "classification"
+        )
 
 
 def test_regression_holdout_is_random_and_metrics_are_holdout_metrics(monkeypatch):

@@ -35,10 +35,31 @@ from app.core.model_selector import (
     infer_task_type,
     is_categorical_target_schema,
     model_requires_scaling,
+    model_supports_sparse_input,
 )
+from app.core.memory import SparseToDenseGuard, estimate_dataframe_memory
 
 logger = logging.getLogger(__name__)
+
+
+class TrainingCancelled(RuntimeError):
+    """Training reached a safe checkpoint after a run cancellation request."""
+
+
+def _raise_if_cancelled(cancel_check) -> None:
+    if cancel_check is not None and cancel_check():
+        raise TrainingCancelled("Training stopped at a safe cancellation checkpoint.")
+
+
+def _report_progress(progress_callback, event_type: str, details: dict[str, Any]) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(event_type, details)
+    except Exception as exc:
+        logger.warning("Training progress event failed (error_type=%s)", type(exc).__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+MAX_PERMUTATION_IMPORTANCE_ROWS = 2_000
 
 def _to_b64(fig: plt.Figure) -> str:
     buf = BytesIO()
@@ -55,11 +76,20 @@ def _clone_or_copy(value: Any) -> Any:
         return copy.deepcopy(value)
 
 
-def _pipeline(preprocessor: Any, model: Any) -> Pipeline:
+def _pipeline(preprocessor: Any, model: Any, projected_rows: int | None = None) -> Pipeline:
     fitted_preprocessor = _clone_or_copy(preprocessor)
     if hasattr(fitted_preprocessor, "scale_numeric"):
         fitted_preprocessor.set_params(scale_numeric=model_requires_scaling(model))
-    return Pipeline([("prep", fitted_preprocessor), ("model", _clone_or_copy(model))])
+    model_input = (
+        "passthrough"
+        if model_supports_sparse_input(model)
+        else SparseToDenseGuard(projected_rows=projected_rows)
+    )
+    return Pipeline([
+        ("prep", fitted_preprocessor),
+        ("model_input", model_input),
+        ("model", _clone_or_copy(model)),
+    ])
 
 
 def _split_data(X, y, task_type):
@@ -269,13 +299,23 @@ def _apply_training_class_weights(candidates, y_train, task_type):
     return balanced, decision
 
 
-def _cross_validation_metrics(preprocessor, model, X, y, task_type, splitter):
+def _cross_validation_metrics(
+    preprocessor,
+    model,
+    X,
+    y,
+    task_type,
+    splitter,
+    projected_rows=None,
+    cancel_check=None,
+):
     if splitter is None:
         raise ValueError("No defensible training-only cross-validation split is available.")
 
     fold_metrics = []
     for train_indices, validation_indices in splitter.split(X, y):
-        fold_pipeline = _pipeline(preprocessor, model)
+        _raise_if_cancelled(cancel_check)
+        fold_pipeline = _pipeline(preprocessor, model, projected_rows=projected_rows)
         X_fold_train = X.iloc[train_indices]
         y_fold_train = y.iloc[train_indices]
         X_fold_validation = X.iloc[validation_indices]
@@ -293,8 +333,8 @@ def _cross_validation_metrics(preprocessor, model, X, y, task_type, splitter):
     }
 
 
-def _fit_full_pipeline(preprocessor, model, X, y):
-    pipe = _pipeline(preprocessor, model)
+def _fit_full_pipeline(preprocessor, model, X, y, projected_rows=None):
+    pipe = _pipeline(preprocessor, model, projected_rows=projected_rows)
     pipe.fit(X, y)
     return pipe
 
@@ -302,7 +342,10 @@ def _fit_full_pipeline(preprocessor, model, X, y):
 # ==========================================
 # PHASE 2.1: OPTUNA TUNING
 # ==========================================
-def _tune_with_optuna(preprocessor, model, X_train, y_train, task_type, primary_metric):
+def _tune_with_optuna(
+    preprocessor, model, X_train, y_train, task_type, primary_metric,
+    projected_rows=None, cancel_check=None,
+):
     """Tune RandomForest or HistGradientBoosting using Optuna."""
     model_name = type(model).__name__
     
@@ -318,6 +361,7 @@ def _tune_with_optuna(preprocessor, model, X_train, y_train, task_type, primary_
         )
 
     def objective(trial):
+        _raise_if_cancelled(cancel_check)
         if "RandomForest" in model_name:
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 200),
@@ -333,6 +377,9 @@ def _tune_with_optuna(preprocessor, model, X_train, y_train, task_type, primary_
             
         trial_model = _clone_or_copy(model)
         trial_model.set_params(**params)
+        cv_options = {"projected_rows": projected_rows}
+        if cancel_check is not None:
+            cv_options["cancel_check"] = cancel_check
         metrics = _cross_validation_metrics(
             preprocessor,
             trial_model,
@@ -340,6 +387,7 @@ def _tune_with_optuna(preprocessor, model, X_train, y_train, task_type, primary_
             y_train,
             task_type,
             splitter,
+            **cv_options,
         )
         return metrics[primary_metric]
 
@@ -351,6 +399,8 @@ def _tune_with_optuna(preprocessor, model, X_train, y_train, task_type, primary_
         tuned_model = _clone_or_copy(model)
         tuned_model.set_params(**best_params)
         return tuned_model, best_params
+    except TrainingCancelled:
+        raise
     except Exception as e:
         logger.warning("Optuna tuning failed; keeping CV-selected defaults: %s", e)
         return _clone_or_copy(model), {}
@@ -401,9 +451,35 @@ def train_and_evaluate(
     task_type: str,
     target_is_categorical: bool | None = None,
     target_name: str | None = None,
+    cancel_check=None,
+    progress_callback=None,
 ) -> dict[str, Any]:
-    X = X.reset_index(drop=True)
-    y = y.reset_index(drop=True)
+    _raise_if_cancelled(cancel_check)
+    if not (
+        isinstance(X.index, pd.RangeIndex)
+        and X.index.start == 0
+        and X.index.step == 1
+        and X.index.stop == len(X)
+    ):
+        X = X.reset_index(drop=True)
+    if not (
+        isinstance(y.index, pd.RangeIndex)
+        and y.index.start == 0
+        and y.index.step == 1
+        and y.index.stop == len(y)
+    ):
+        y = y.reset_index(drop=True)
+    feature_memory = estimate_dataframe_memory(X)
+    memory_summary = {
+        "feature_frame": feature_memory,
+        "dataset_warning_threshold_mb": int(settings.DATASET_MEMORY_WARNING_MB),
+        "feature_frame_warning": (
+            feature_memory["bytes"]
+            > settings.DATASET_MEMORY_WARNING_MB * 1024 * 1024
+        ),
+        "dense_conversion_limit_mb": int(settings.MAX_DENSE_CONVERSION_MB),
+        "prediction_batch_size": int(settings.PREDICTION_BATCH_SIZE),
+    }
     if task_type is None:
         task_type = "auto"
     if task_type == "auto":
@@ -470,7 +546,11 @@ def train_and_evaluate(
 
     # Candidate comparison uses only CV folds within the training partition.
     for name, model in candidates:
+        _raise_if_cancelled(cancel_check)
         try:
+            cv_options = {"projected_rows": len(X)}
+            if cancel_check is not None:
+                cv_options["cancel_check"] = cancel_check
             metrics = _cross_validation_metrics(
                 preprocessor,
                 model,
@@ -478,23 +558,45 @@ def train_and_evaluate(
                 y_train,
                 task_type,
                 splitter,
+                **cv_options,
             )
             results.append({"model": name, **metrics})
+            _report_progress(
+                progress_callback,
+                "model_evaluated",
+                {"model": str(name), "metrics": metrics},
+            )
             score = metrics.get(primary_metric, -np.inf)
             if np.isfinite(score) and score > best_score:
                 best_score, selected_model, best_name = float(score), model, name
+        except TrainingCancelled:
+            raise
         except Exception as exc:
             failures.append({"model": name, "error": str(exc)})
 
     if selected_model is None:
+        memory_errors = [
+            item for item in failures
+            if "dense matrix" in item.get("error", "").lower()
+            or "dense input" in item.get("error", "").lower()
+        ]
+        if memory_errors:
+            details = "; ".join(
+                f"{item['model']}: {item['error']}" for item in memory_errors[:3]
+            )
+            raise RuntimeError(
+                "No candidate could be trained safely within the configured dense-conversion "
+                f"memory limit. {details}"
+            )
         raise RuntimeError(
-            "All candidate models failed training-only cross-validation; "
-            "no model was selected."
+            "All candidate models failed training-only cross-validation; no model was selected. "
+            + "; ".join(f"{item['model']}: {item['error']}" for item in failures[:3])
         )
 
     # Tune only on the training partition; the holdout remains inaccessible.
     tuning_params = {}
     if len(X_train) > 50:
+        _raise_if_cancelled(cancel_check)
         logger.info("Tuning %s with training-only cross-validation", best_name)
         selected_model_before_tuning = selected_model
         selected_model, tuning_params = _tune_with_optuna(
@@ -504,9 +606,14 @@ def train_and_evaluate(
             y_train,
             task_type,
             primary_metric,
+            projected_rows=len(X),
+            cancel_check=cancel_check,
         )
         if tuning_params:
             try:
+                cv_options = {"projected_rows": len(X)}
+                if cancel_check is not None:
+                    cv_options["cancel_check"] = cancel_check
                 tuned_cv_metrics = _cross_validation_metrics(
                     preprocessor,
                     selected_model,
@@ -514,7 +621,10 @@ def train_and_evaluate(
                     y_train,
                     task_type,
                     splitter,
+                    **cv_options,
                 )
+            except TrainingCancelled:
+                raise
             except Exception:
                 logger.exception(
                     "Tuned model failed its final training-only CV comparison; "
@@ -530,7 +640,8 @@ def train_and_evaluate(
                         break
 
     # Evaluate exactly one training-fitted pipeline on the untouched holdout.
-    evaluation_pipeline = _pipeline(preprocessor, selected_model)
+    _raise_if_cancelled(cancel_check)
+    evaluation_pipeline = _pipeline(preprocessor, selected_model, projected_rows=len(X))
     evaluation_pipeline.fit(X_train, y_train)
     holdout_predictions = evaluation_pipeline.predict(X_test)
     final_test_metrics = _calculate_metrics(y_test, holdout_predictions, task_type)
@@ -553,13 +664,22 @@ def train_and_evaluate(
     # The evaluation pipeline is still fitted on training rows here.
     feature_importances, importance_chart = {}, ""
     try:
+        importance_X = X_test
+        importance_y = y_test
+        if len(importance_X) > MAX_PERMUTATION_IMPORTANCE_ROWS:
+            sampled_index = importance_X.sample(
+                n=MAX_PERMUTATION_IMPORTANCE_ROWS,
+                random_state=settings.RANDOM_STATE,
+            ).index
+            importance_X = importance_X.loc[sampled_index]
+            importance_y = importance_y.loc[sampled_index]
         importance_result = permutation_importance(
             evaluation_pipeline,
-            X_test,
-            y_test,
+            importance_X,
+            importance_y,
             n_repeats=5,
             random_state=settings.RANDOM_STATE,
-            n_jobs=-1,
+            n_jobs=1,
         )
         feature_importances = {
             str(name): float(value)
@@ -577,10 +697,25 @@ def train_and_evaluate(
 
     # Only after all independent evaluation work is complete, refit a fresh
     # production pipeline on every available row.
-    production_pipeline = _fit_full_pipeline(preprocessor, selected_model, X, y)
+    _raise_if_cancelled(cancel_check)
+    production_pipeline = _fit_full_pipeline(
+        preprocessor, selected_model, X, y, projected_rows=len(X)
+    )
     fitted_preprocessing = list(
         getattr(production_pipeline.named_steps["prep"], "operations_", [])
     )
+    memory_summary["encoded_matrix_format"] = next(
+        (
+            operation.get("format")
+            for operation in fitted_preprocessing
+            if operation.get("type") == "encoded_matrix_format"
+        ),
+        "unknown",
+    )
+    memory_summary["dense_only_estimator"] = not model_supports_sparse_input(
+        selected_model
+    )
+    memory_summary["permutation_importance_rows"] = int(len(importance_X))
     if imbalance_operation is not None:
         fitted_preprocessing.append(imbalance_operation)
     evaluation = {
@@ -615,6 +750,7 @@ def train_and_evaluate(
         "extra_charts": extra_charts,
         "tuning_params": tuning_params,
         "failures": failures,
+        "memory_summary": memory_summary,
     }
 
 

@@ -10,17 +10,22 @@ from app.agent import agent as agent_module
 from app.agent.llm import extract_message
 
 
+class _NoopToolSession:
+    def close(self):
+        pass
+
+
 def _response(*, content: str = "", tool_calls=None):
     message = SimpleNamespace(content=content, tool_calls=tool_calls)
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
-def _tool_call(arguments):
+def _tool_call(arguments, *, name="rerun_pipeline", call_id="call_1"):
     function = SimpleNamespace(
-        name="rerun_pipeline",
+        name=name,
         arguments=arguments,
     )
-    return SimpleNamespace(id="call_1", type="function", function=function)
+    return SimpleNamespace(id=call_id, type="function", function=function)
 
 
 def test_extract_message_serializes_dict_tool_arguments():
@@ -39,7 +44,12 @@ def test_agent_executes_tool_then_finishes_without_argument_crash():
     responses = [
         _response(
             tool_calls=[
-                _tool_call(json.dumps({"target_column": "price"}))
+                _tool_call({}, name="inspect_dataset", call_id="inspect_1")
+            ],
+        ),
+        _response(
+            tool_calls=[
+                _tool_call(json.dumps({"target_column": "other"}), call_id="run_1")
             ],
         ),
         _response(content="Pipeline finished successfully."),
@@ -70,21 +80,24 @@ def test_agent_executes_tool_then_finishes_without_argument_crash():
         patch.object(agent_module, "create_message", side_effect=fake_create_message),
         patch.object(agent_module, "load_history", return_value=[]),
         patch.object(agent_module, "get_tool_schemas", return_value=[]),
+        patch.object(agent_module, "SessionLocal", _NoopToolSession),
+        patch.object(agent_module, "is_cancellation_requested", return_value=False),
     ):
         result = asyncio.run(
             agent_module.run_agent(
                 session_id="session-1",
-                user_message="Run the pipeline for price.",
+                user_message="Run the full pipeline with target column is price.",
                 db=object(),
             )
         )
 
     assert result["content"] == "Pipeline finished successfully."
-    assert result["iterations"] == 2
+    assert result["iterations"] == 3
     assert tool_arguments == [
-        ("session-1", "rerun_pipeline", {"target_column": "price"})
+        ("session-1", "inspect_dataset", {}),
+        ("session-1", "rerun_pipeline", {"target_column": "price"}),
     ]
-    assert len(llm_call_messages) == 2
+    assert len(llm_call_messages) == 3
     assistant_message = next(
         item
         for item in llm_call_messages[1]
@@ -109,8 +122,12 @@ def test_agent_stops_after_tool_error_without_retrying():
     async def fake_chat(*, messages, tools):
         nonlocal llm_calls
         llm_calls += 1
+        if llm_calls == 1:
+            return _response(
+                tool_calls=[_tool_call({}, name="inspect_dataset", call_id="inspect_1")]
+            )
         return _response(
-            tool_calls=[_tool_call(json.dumps({"target_column": "price"}))],
+            tool_calls=[_tool_call(json.dumps({"target_column": "price"}), call_id="run_1")]
         )
 
     def fake_create_message(db, **kwargs):
@@ -122,11 +139,16 @@ def test_agent_stops_after_tool_error_without_retrying():
         patch.object(
             agent_module,
             "execute_tool",
-            return_value={"ok": False, "error": "dataset is too small"},
+            side_effect=[
+                {"ok": True, "status": "profiled"},
+                {"ok": False, "error": "dataset is too small"},
+            ],
         ),
         patch.object(agent_module, "create_message", side_effect=fake_create_message),
         patch.object(agent_module, "load_history", return_value=[]),
         patch.object(agent_module, "get_tool_schemas", return_value=[]),
+        patch.object(agent_module, "SessionLocal", _NoopToolSession),
+        patch.object(agent_module, "is_cancellation_requested", return_value=False),
     ):
         result = asyncio.run(
             agent_module.run_agent(
@@ -136,11 +158,10 @@ def test_agent_stops_after_tool_error_without_retrying():
             )
         )
 
-    assert llm_calls == 1
-    assert result["iterations"] == 1
-    assert result["content"] == (
-        "Tool 'rerun_pipeline' failed: dataset is too small"
-    )
+    assert llm_calls == 2
+    assert result["iterations"] == 2
+    assert "rerun_pipeline operation did not complete" in result["content"]
+    assert "dataset is too small" in result["content"]
     assert any(
         item.get("role") == "assistant"
         and item.get("content") == result["content"]

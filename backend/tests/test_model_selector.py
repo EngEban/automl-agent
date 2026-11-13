@@ -6,10 +6,12 @@ import pandas as pd
 import pytest
 
 from app.core.model_selector import (
+    MODEL_REGISTRY,
     auto_detect_target,
     detect_target_column,
     detect_task_type,
     infer_task_type,
+    model_supports_sparse_input,
 )
 
 
@@ -23,6 +25,25 @@ def test_explicit_target_is_respected_and_invalid_name_is_actionable():
     assert result["confidence"] == 100
     with pytest.raises(ValueError, match="does not exist.*Choose one of"):
         detect_target_column(frame, explicit_target="missing")
+
+
+def test_registered_estimator_sparse_capabilities_match_installed_sklearn():
+    from scipy import sparse
+
+    X = sparse.csr_matrix(np.arange(24, dtype=float).reshape(12, 2))
+    labels = np.array([0, 1] * 6)
+    values = np.arange(12, dtype=float)
+
+    for task_type, specs in MODEL_REGISTRY.items():
+        y = labels if task_type == "classification" else values
+        for spec in specs:
+            estimator = spec.factory()
+            assert model_supports_sparse_input(estimator) is spec.supports_sparse_input
+            if spec.supports_sparse_input:
+                estimator.fit(X, y)
+            else:
+                with pytest.raises((TypeError, ValueError), match="[Ss]parse"):
+                    estimator.fit(X, y)
 
 
 def test_strong_name_selects_candidate_without_last_column_bias():
@@ -187,6 +208,9 @@ def test_agent_training_surfaces_ambiguous_numeric_task_type(monkeypatch):
     monkeypatch.setattr(
         executor, "_require_training_run", lambda *_args: object()
     )
+    monkeypatch.setattr(executor, "_check_run_cancellation", lambda *_args: None)
+    monkeypatch.setattr(executor, "emit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(executor, "is_cancellation_requested", lambda *_args: False)
     monkeypatch.setattr(executor, "_session_dir", lambda *_args: __import__("pathlib").Path("."))
     monkeypatch.setattr(executor, "_load_raw", lambda *_args: frame)
     monkeypatch.setattr(executor, "_load_state", lambda *_args: {})
@@ -197,9 +221,10 @@ def test_agent_training_surfaces_ambiguous_numeric_task_type(monkeypatch):
         "prepare_xy_for_training",
         lambda *_args: (frame[["feature"]], frame["target"], []),
     )
+    db = type("DB", (), {"commit": lambda self: None, "close": lambda self: None})()
 
     result = executor.execute_tool(
-        "session-1", "train_models", {"task_type": "auto"}, object(), run_id="run-1"
+        "session-1", "train_models", {"task_type": "auto"}, db, run_id="run-1"
     )
 
     assert result["ok"] is False
@@ -216,5 +241,5 @@ def test_agent_rerun_rejects_an_unsupported_explicit_task_type():
     )
 
     assert result["ok"] is False
-    assert result["error_type"] == "ValueError"
-    assert "Choose classification, regression, or auto" in result["error"]
+    assert result["error_type"] == "ToolValidationError"
+    assert "must be one of: classification, regression, auto" in result["error"]

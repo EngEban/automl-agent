@@ -64,8 +64,27 @@ async def get_status(task_id: str):
             step=meta.get("step"), progress=meta.get("progress"),
         )
     if state == "SUCCESS":
-        return TaskStatus(task_id=task_id, status="done", result=meta)
-    return TaskStatus(task_id=task_id, status="failed", error=str(result.info))
+        if meta.get("status") == "failed":
+            return TaskStatus(
+                task_id=task_id,
+                status="failed",
+                error="Analysis task failed. Check server logs for details.",
+            )
+        safe_fields = {
+            "analysis_status",
+            "report_status",
+            "best_model",
+            "task_type",
+            "target_column",
+            "memory_summary",
+        }
+        safe_result = {key: meta[key] for key in safe_fields if key in meta}
+        return TaskStatus(task_id=task_id, status="done", result=safe_result)
+    return TaskStatus(
+        task_id=task_id,
+        status="failed",
+        error="Analysis task failed. Check server logs for details.",
+    )
 
 
 @router.get("/download/report/{task_id}")

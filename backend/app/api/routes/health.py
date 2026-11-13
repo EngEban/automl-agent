@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.agent.llm import verify_connection
+from app.agent.llm import supports_native_tool_calling, verify_connection
 from app.agent.tools import get_tool_schemas
 from app.config import settings
 from app.schemas.agent import AgentConfig, ToolInfo
@@ -26,6 +26,10 @@ def agent_config() -> AgentConfig:
         temperature=settings.LLM_TEMPERATURE,
         max_iterations=settings.AGENT_MAX_ITERATIONS,
         has_api_key=bool(settings.LLM_API_KEY) or settings.LLM_PROVIDER == "ollama",
+        max_tool_calls=settings.AGENT_MAX_TOOL_CALLS,
+        model_family_supports_tool_calling=supports_native_tool_calling(
+            settings.LLM_PROVIDER, settings.LLM_MODEL
+        ),
     )
 
 

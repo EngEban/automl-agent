@@ -13,7 +13,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
 from app.config import settings
-from app.core.preprocessing import prepare_xy_with_target_encoder
+from app.core.preprocessing import IntelligentPreprocessor, prepare_xy_with_target_encoder
 from app.services import inference_service
 
 
@@ -193,3 +193,69 @@ def test_invalid_encoded_prediction_fails_safely(monkeypatch, tmp_path) -> None:
         inference_service.run_inference(
             object(), "model-version-1", [{"feature": 10.0}]
         )
+
+
+def test_prediction_batches_preserve_order_labels_and_transform_once_per_batch(
+    monkeypatch, tmp_path
+) -> None:
+    X = pd.DataFrame({
+        "number": np.arange(12, dtype=float),
+        "group": ["north", "south"] * 6,
+    })
+    labels = LabelEncoder().fit(["cat", "dog"])
+    y = np.array([0, 1] * 6)
+    pipeline = Pipeline([
+        ("prep", IntelligentPreprocessor(list(X.columns))),
+        ("model_input", "passthrough"),
+        ("model", DummyClassifier(strategy="prior")),
+    ])
+    pipeline.fit(X, y)
+    records = [
+        {"number": 12.0, "group": "north"},
+        {"number": 13.0, "group": "unseen"},
+        {"number": 14.0},
+        {"number": 15.0, "group": "south"},
+        {"number": 16.0, "group": "north"},
+    ]
+    expected_input = pd.DataFrame(records).reindex(columns=list(X.columns))
+    expected_predictions = labels.inverse_transform(pipeline.predict(expected_input)).tolist()
+    expected_probabilities = pipeline.predict_proba(expected_input)
+    _persist_artifact(
+        tmp_path,
+        monkeypatch,
+        {
+            "artifact_format_version": 1,
+            "pipeline": pipeline,
+            "target_encoder": labels,
+            "task_type": "classification",
+            "input_columns": list(X.columns),
+        },
+    )
+    monkeypatch.setattr(settings, "PREDICTION_BATCH_SIZE", 2)
+
+    transformed_batch_sizes = []
+    original_transform = IntelligentPreprocessor.transform
+
+    def count_transform(self, values):
+        transformed_batch_sizes.append(len(values))
+        return original_transform(self, values)
+
+    def reject_refit(self, *_args, **_kwargs):
+        raise AssertionError("Inference must reuse fitted preprocessing.")
+
+    monkeypatch.setattr(IntelligentPreprocessor, "transform", count_transform)
+    monkeypatch.setattr(IntelligentPreprocessor, "fit", reject_refit)
+    monkeypatch.setattr(
+        IntelligentPreprocessor,
+        "fit_transform",
+        reject_refit,
+    )
+
+    response = inference_service.run_inference(
+        object(), "model-version-1", records
+    )
+
+    assert response.predictions == expected_predictions
+    assert len(response.probabilities) == len(records)
+    np.testing.assert_allclose(response.probabilities, expected_probabilities)
+    assert transformed_batch_sizes == [2, 2, 1]

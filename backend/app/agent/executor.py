@@ -21,20 +21,34 @@ from app.core import trainer as trainer_mod
 from app.core.code_generator import generate_notebook
 from app.core.data_loader import describe, load_from_path, load_from_url
 from app.core.data_profiler import profile_dataset
+from app.core.memory import estimate_dataframe_memory
 from app.core.model_selector import (
     auto_detect_target,
+    detect_target_column,
     is_categorical_target_schema,
     validate_target_column,
 )
-from app.core.report_generator import generate_report as render_report
+from app.agent.tools import ToolValidationError, validate_tool_arguments
+from app.agents.report_agent.service import generate_report_safely
 from app.db.crud import (
     create_artifact, create_operation, get_run, get_session, list_artifacts, list_operations,
     update_session, create_experiment, create_model_version, create_plan,
-    get_latest_run_for_session, update_run, create_dataset_source,
+    get_latest_run_for_session, list_model_versions, create_dataset_source,
 )
+from app.db.session import SessionLocal
 from app.services.notification_service import send_completion_email
+from app.services.run_service import emit_event, is_cancellation_requested
 
 logger = logging.getLogger(__name__)
+
+
+class OperationCancelled(RuntimeError):
+    """A run cancellation was observed before starting another pipeline stage."""
+
+
+def _check_run_cancellation(run_id: str | None) -> None:
+    if is_cancellation_requested(run_id):
+        raise OperationCancelled("Cancellation was requested before the next stage.")
 
 SESSIONS_DIR = settings.STORAGE_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,7 +58,12 @@ class ModelRegistryPersistenceError(RuntimeError):
     """Raised when a trained model cannot be registered atomically."""
 
 
-def _require_training_run(db: DBSession, session_id: str, run_id: str | None):
+def _require_training_run(
+    db: DBSession,
+    session_id: str,
+    run_id: str | None,
+    user_id: str | None = None,
+):
     if not run_id:
         raise ValueError(
             "Training requires an explicit AnalysisRun context; no experiment "
@@ -61,6 +80,8 @@ def _require_training_run(db: DBSession, session_id: str, run_id: str | None):
             f"AnalysisRun '{run_id}' does not belong to session '{session_id}'; "
             "no experiment was registered."
         )
+    if user_id is not None and str(run.requested_by) != str(user_id):
+        raise PermissionError("The AnalysisRun does not belong to the authenticated user.")
     return run
 
 
@@ -104,7 +125,7 @@ def _tool_get_session_status(session_id: str, args: dict, db: DBSession) -> dict
     if session is None:
         raise ValueError(f"Session '{session_id}' not found.")
     state = _load_state(session_id)
-    artifacts = [{"type": artifact.artifact_type, "path": artifact.file_path} for artifact in list_artifacts(db, session_id)]
+    artifacts = [{"type": artifact.artifact_type} for artifact in list_artifacts(db, session_id)]
     session_files = [path.name for path in _session_dir(session_id).iterdir()]
     return {
         "session_id": session_id,
@@ -119,6 +140,10 @@ def _tool_get_session_status(session_id: str, args: dict, db: DBSession) -> dict
             "report": any(item["type"] == "report" for item in artifacts),
         },
         "best_model": state.get("best_model"),
+        "best_score": state.get("best_score"),
+        "metric": state.get("metric"),
+        "evaluation": state.get("evaluation"),
+        "report_status": state.get("report_status"),
         "artifacts": artifacts,
     }
 
@@ -131,17 +156,59 @@ def _tool_inspect_dataset(session_id: str, args: dict, db: DBSession) -> dict:
     target = session.target_column if session else None
     task_type = session.task_type if session else None
     profile = profile_dataset(df, target=target, task_type=task_type)
+    stored_metadata = session.dataset_meta if session and isinstance(session.dataset_meta, dict) else {}
+    loading_metadata = info.get("loading_metadata") or stored_metadata.get("loading_metadata")
+    if isinstance(loading_metadata, dict):
+        loading_metadata = dict(loading_metadata)
+        profile_scope = (
+            "loaded sample"
+            if loading_metadata.get("sampling_applied")
+            else "complete source"
+        )
+    else:
+        loading_metadata = {
+            "original_row_count": None,
+            "loaded_row_count": int(len(df)),
+            "sampling_applied": None,
+            "sampling_limit": int(settings.MAX_ROWS_SAMPLE),
+            "sampling_method": "unknown for this existing session",
+            "sampling_seed": None,
+            "chunk_size": None,
+        }
+        profile_scope = "loaded rows; original source size is unavailable"
+    input_memory_bytes = (
+        int(profile.memory_usage_bytes)
+        if profile.memory_usage_bytes is not None
+        else int(estimate_dataframe_memory(df)["bytes"])
+    )
+    input_memory = {
+        "rows": int(len(df)),
+        "columns": int(df.shape[1]),
+        "bytes": input_memory_bytes,
+        "megabytes": round(input_memory_bytes / (1024 * 1024), 3),
+    }
+    input_memory_summary = {
+        "source_dataset": input_memory,
+        "dataset_warning_threshold_mb": int(settings.DATASET_MEMORY_WARNING_MB),
+        "dataset_warning": (
+            input_memory["bytes"] > settings.DATASET_MEMORY_WARNING_MB * 1024 * 1024
+        ),
+        "full_memory_loading": True,
+    }
     
     profile_path = _session_dir(session_id) / "dataset_profile.json"
     profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
 
     result = {
         "shape": info["n_rows"],
+        "loading_metadata": loading_metadata,
+        "profile_scope": profile_scope,
         "columns": info["columns"],
         "dtypes": info["dtypes"],
         "missing_total": info["missing_total"],
         "duplicate_rows": info["duplicate_rows"],
         "quality_score": profile.quality_score,
+        "memory_summary": input_memory_summary,
         "warnings": profile.warnings[:20],
         "warning_count": len(profile.warnings),
         "profile_summary": {
@@ -173,6 +240,13 @@ def _tool_inspect_dataset(session_id: str, args: dict, db: DBSession) -> dict:
         ][:20],
         "target_suggestions": auto_detect_target(df),
     }
+    if loading_metadata.get("sampling_applied"):
+        result["warnings"] = [
+            f"Profiling statistics describe the deterministic sample of "
+            f"{loading_metadata['loaded_row_count']:,} loaded rows from "
+            f"{loading_metadata['original_row_count']:,} source rows."
+        ] + result["warnings"]
+        result["warning_count"] = len(result["warnings"])
 
     # Handle explicit opt-in for sample rows (privacy)
     if args.get("include_sample_rows"):
@@ -258,12 +332,28 @@ def _tool_train_models(
     if session is None:
         raise ValueError(f"Session '{session_id}' not found.")
     run = _require_training_run(db, session_id, run_id)
+    _check_run_cancellation(run_id)
 
     session_dir = _session_dir(session_id)
     df = _load_raw(db, session_id)
-    target = session.target_column
+    target = args.get("target_column") or session.target_column
     if not target:
-        raise ValueError("Target column is not set in the session.")
+        target_result = detect_target_column(df)
+        target = target_result.get("selected")
+        if not target:
+            return {
+                "status": "needs_input",
+                "error": target_result.get("message", "Choose a target column before training."),
+                "error_type": "TargetSelectionRequired",
+                "target_candidates": [
+                    item.get("column")
+                    for item in target_result.get("candidates", [])
+                    if isinstance(item, dict) and item.get("column")
+                ],
+            }
+    validate_target_column(df, target)
+    if target != session.target_column:
+        _tool_set_target_column(session_id, {"column": target}, db)
 
     X, y, _ = prep_mod.prepare_xy_for_training(df, target)
     preprocessor, _ = prep_mod.build_preprocessor(X)
@@ -272,14 +362,72 @@ def _tool_train_models(
     if task_type is None:
         task_type = "auto"
     target_is_categorical = is_categorical_target_schema(df[target])
-    training = trainer_mod.train_and_evaluate(
-        X,
-        y,
-        preprocessor,
-        task_type,
-        target_is_categorical=target_is_categorical,
-        target_name=target,
-    )
+    _check_run_cancellation(run_id)
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "training.started",
+            step="training",
+            progress=0,
+            message="Candidate model evaluation started.",
+        )
+    db.close()
+    try:
+        training_kwargs = {
+            "target_is_categorical": target_is_categorical,
+            "target_name": target,
+        }
+        if run_id is not None:
+            training_kwargs["cancel_check"] = lambda: is_cancellation_requested(run_id)
+            def progress_callback(event_type: str, details: dict[str, Any]) -> None:
+                event_db = SessionLocal()
+                try:
+                    model_name = str(details.get("model", "candidate"))[:100]
+                    emit_event(
+                        event_db,
+                        run_id,
+                        event_type,
+                        step="training",
+                        progress=0,
+                        message=f"Candidate model {model_name} was evaluated.",
+                        payload=details,
+                    )
+                finally:
+                    event_db.close()
+            training_kwargs["progress_callback"] = progress_callback
+        training = trainer_mod.train_and_evaluate(
+            X,
+            y,
+            preprocessor,
+            task_type,
+            **training_kwargs,
+        )
+    except trainer_mod.TrainingCancelled:
+        if run_id:
+            emit_event(
+                db,
+                run_id,
+                "training.cancelled",
+                step="training",
+                progress=0,
+                message="Training stopped at a safe cancellation checkpoint.",
+            )
+        return {
+            "status": "cancelled",
+            "error": "Training stopped at a safe cancellation checkpoint.",
+            "error_type": "CancellationRequested",
+        }
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "training.completed",
+            step="training",
+            progress=0,
+            message="Candidate evaluation and production model fitting completed.",
+            payload={"best_model": training.get("best_model_name")},
+        )
     task_type = training.get("task_type", task_type)
     target_encoder = training.get("target_encoder")
     preprocessing_operations = training.get("preprocessing_operations", [])
@@ -294,6 +442,36 @@ def _tool_train_models(
         )
 
     profile = profile_dataset(df, target=target, task_type=task_type)
+    source_memory_bytes = (
+        int(profile.memory_usage_bytes)
+        if profile.memory_usage_bytes is not None
+        else int(estimate_dataframe_memory(df)["bytes"])
+    )
+    source_memory = {
+        "rows": int(len(df)),
+        "columns": int(df.shape[1]),
+        "bytes": source_memory_bytes,
+        "megabytes": round(source_memory_bytes / (1024 * 1024), 3),
+    }
+    memory_summary = dict(training.get("memory_summary") or {})
+    memory_summary.update({
+        "source_dataset": source_memory,
+        "dataset_warning_threshold_mb": int(settings.DATASET_MEMORY_WARNING_MB),
+        "dataset_warning": (
+            source_memory_bytes > settings.DATASET_MEMORY_WARNING_MB * 1024 * 1024
+        ),
+        "full_memory_loading": True,
+    })
+    training["memory_summary"] = memory_summary
+    loading_metadata = (
+        dict(df.attrs.get("loading_metadata", {}))
+        if isinstance(df.attrs.get("loading_metadata"), dict)
+        else {}
+    )
+    if not loading_metadata:
+        session_metadata = getattr(session, "dataset_meta", None)
+        stored_metadata = session_metadata if isinstance(session_metadata, dict) else {}
+        loading_metadata = dict(stored_metadata.get("loading_metadata", {}))
     profile_path = session_dir / "dataset_profile.json"
     profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
     eda_summary_path = session_dir / "eda_summary.json"
@@ -319,6 +497,9 @@ def _tool_train_models(
     state["selection_metric"] = training.get("selection_metric", training["metric"])
     state["evaluation"] = training.get("evaluation")
     state["final_test_metrics"] = training.get("final_test_metrics")
+    state["memory_summary"] = memory_summary
+    state["training_failures"] = training.get("failures", [])
+    state["loading_metadata"] = loading_metadata
     if training.get("tuning_params"):
         state["tuning_params"] = training["tuning_params"]
     _save_state(session_id, state)
@@ -357,6 +538,9 @@ def _tool_train_models(
                 "evaluation": training.get("evaluation"),
                 "final_test_metrics": training.get("final_test_metrics"),
                 "preprocessing_operations": preprocessing_operations,
+                "memory_summary": memory_summary,
+                "failures": training.get("failures", []),
+                "loading_metadata": loading_metadata,
             },
             ensure_ascii=False,
             indent=2,
@@ -383,6 +567,9 @@ def _tool_train_models(
             ),
             "evaluation": training.get("evaluation"),
             "final_test_metrics": training.get("final_test_metrics"),
+            "memory_summary": memory_summary,
+            "failures": training.get("failures", []),
+            "loading_metadata": loading_metadata,
         }
         experiment = create_experiment(
             db,
@@ -432,10 +619,19 @@ def _tool_train_models(
         "evaluation": training.get("evaluation"),
         "final_test_metrics": training.get("final_test_metrics"),
         "preprocessing_operations": preprocessing_operations,
+        "memory_summary": memory_summary,
+        "failures": training.get("failures", []),
+        "loading_metadata": loading_metadata,
     }
 
 
-def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
+def _tool_generate_report(
+    session_id: str,
+    args: dict,
+    db: DBSession,
+    run_id: str | None = None,
+) -> dict:
+    _check_run_cancellation(run_id)
     session_dir = _session_dir(session_id)
     state = _load_state(session_id)
     if not state.get("results"):
@@ -457,6 +653,11 @@ def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
 
     df = _load_raw(db, session_id)
     data_desc = describe(df)
+    if not data_desc.get("loading_metadata"):
+        session = get_session(db, session_id)
+        stored_metadata = session.dataset_meta if session and isinstance(session.dataset_meta, dict) else {}
+        if stored_metadata.get("loading_metadata"):
+            data_desc["loading_metadata"] = stored_metadata["loading_metadata"]
     eda_summary = {"summary": {"readiness": {}}, "figures": figures}
     summary_path = session_dir / "eda_summary.json"
     if summary_path.exists():
@@ -481,14 +682,119 @@ def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
         "evaluation": state.get("evaluation"),
         "final_test_metrics": state.get("final_test_metrics"),
         "preprocessing_operations": state.get("preprocessing_operations", []),
+        "memory_summary": state.get("memory_summary", {}),
+        "failures": state.get("training_failures", []),
+        "tuning_params": state.get("tuning_params", {}),
+        "loading_metadata": state.get("loading_metadata", {}),
     }
 
-    pdf_path = render_report(
-        task_id=session_id, data=data_desc, eda=eda_summary, operations=operations,
-        training=training_payload, task_type=state.get("task_type", "classification"),
+    try:
+        latest_run = get_latest_run_for_session(db, session_id)
+    except Exception as exc:
+        logger.warning("Optional AnalysisRun report facts unavailable (error_type=%s)", type(exc).__name__)
+        latest_run = None
+    experiment_info = {}
+    registry_info = {}
+    try:
+        registered_versions = list_model_versions(db, session_id)
+        if registered_versions:
+            version = registered_versions[0]
+            experiment = getattr(version, "experiment", None)
+            experiment_info = {
+                "id": getattr(experiment, "id", None),
+                "name": getattr(experiment, "name", None),
+            }
+            registry_info = {
+                "version_id": getattr(version, "id", None),
+                "model_name": getattr(version, "model_name", None),
+                "lifecycle_status": getattr(version, "lifecycle_status", None),
+            }
+    except Exception as exc:
+        logger.warning("Optional Model Registry report facts unavailable (error_type=%s)", type(exc).__name__)
+
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "report.started",
+            step="report",
+            progress=0,
+            message="Report generation started.",
+        )
+    db.close()
+    report_result = generate_report_safely(
+        report_id=session_id,
+        analysis_id=getattr(latest_run, "id", None) or session_id,
+        report_type=str(args.get("report_type", "machine_learning_analysis")),
+        language=str(args.get("language", "English")),
+        data=data_desc,
+        eda=eda_summary,
+        operations=operations,
+        training=training_payload,
+        task_type=state.get("task_type", "classification"),
         target_column=state.get("target_column", ""),
+        experiment=experiment_info,
+        model_registry=registry_info,
     )
-    create_artifact(db, session_id=session_id, artifact_type="report", file_path=str(pdf_path), meta={})
+    report_artifact_exists = False
+    for candidate in (report_result.get("pdf_path"), report_result.get("html_path")):
+        if not candidate:
+            continue
+        try:
+            artifact_path = Path(str(candidate)).resolve()
+            artifact_path.relative_to(settings.REPORT_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        if artifact_path.is_file():
+            report_artifact_exists = True
+            break
+    if report_result.get("status") == "success" and not report_artifact_exists:
+        report_result = {
+            **report_result,
+            "status": "failed",
+            "error_code": "report_artifact_missing",
+            "message": "The analysis completed, but no report artifact was found.",
+            "pdf_path": None,
+            "html_path": None,
+        }
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "report.completed" if report_result.get("status") == "success" else "report.failed",
+            step="report",
+            progress=0,
+            message=(
+                "A report artifact was generated."
+                if report_result.get("status") == "success"
+                else "Report generation failed; completed analysis results remain available."
+            ),
+            payload={"report_status": report_result.get("status", "failed")},
+        )
+    pdf_path = report_result.get("pdf_path")
+    if pdf_path:
+        try:
+            create_artifact(
+                db,
+                session_id=session_id,
+                artifact_type="report",
+                file_path=str(pdf_path),
+                meta={
+                    "provider": report_result.get("provider"),
+                    "model": report_result.get("model"),
+                    "report_type": report_result.get("report_type"),
+                    "language": report_result.get("language"),
+                    "generation_status": report_result.get("status"),
+                    "validation_status": report_result.get("validation_status"),
+                    "html_path": report_result.get("html_path"),
+                    "metadata_path": report_result.get("metadata_path"),
+                },
+            )
+        except Exception as exc:
+            logger.warning("Generated report artifact could not be registered (error_type=%s)", type(exc).__name__)
+            report_result["artifact_registered"] = False
+        else:
+            report_result["artifact_registered"] = True
 
     session = get_session(db, session_id)
     notebook_path = None
@@ -506,8 +812,13 @@ def _tool_generate_report(session_id: str, args: dict, db: DBSession) -> dict:
         )
         create_artifact(db, session_id=session_id, artifact_type="notebook", file_path=str(notebook_path), meta={})
 
-    update_session(db, session_id, status="reported")
-    return {"report_path": str(pdf_path), "notebook_path": str(notebook_path) if notebook_path else None}
+    if pdf_path:
+        update_session(db, session_id, status="reported")
+    return {
+        **report_result,
+        "report_path": str(pdf_path) if pdf_path else None,
+        "notebook_path": str(notebook_path) if notebook_path else None,
+    }
 
 
 def _tool_get_operations_log(session_id: str, args: dict, db: DBSession) -> dict:
@@ -528,22 +839,53 @@ def _tool_set_target_column(session_id: str, args: dict, db: DBSession) -> dict:
     return {"target_column": column, "note": "rerun the pipeline to apply."}
 
 
-def _tool_propose_plan(session_id: str, args: dict, db: DBSession) -> dict:
+def _tool_propose_plan(
+    session_id: str,
+    args: dict,
+    db: DBSession,
+    run_id: str | None = None,
+) -> dict:
     """Save the plan and return a message asking for approval (Phase 4)."""
-    run = get_latest_run_for_session(db, session_id)
+    run = get_run(db, run_id) if run_id else get_latest_run_for_session(db, session_id)
     if not run:
         raise ValueError("No active run found for this session.")
+    if str(run.session_id) != str(session_id):
+        raise PermissionError("The analysis plan does not belong to this session.")
     df = _load_raw(db, session_id)
-    validate_target_column(df, args.get("target_column"))
-    if args.get("task_type") not in {"classification", "regression"}:
-        raise ValueError("A plan must specify classification or regression.")
-        
-    plan = create_plan(db, run_id=run.id, plan_json=args, approval_status="pending")
-    update_run(db, run.id, status="awaiting_approval")
+    target = validate_target_column(df, args.get("target_column"))
+    task_type = args.get("task_type", "auto")
+    if task_type not in {"classification", "regression", "auto"}:
+        raise ValueError("A plan task type must be classification, regression, or auto.")
+    if task_type == "auto":
+        X, y, _ = prep_mod.prepare_xy_for_training(df, target)
+        _, _, y_probe, _, _ = trainer_mod._task_inference_training_partition(X, y)
+        task_type = trainer_mod._infer_task_type_from_training_data(
+            y_probe,
+            target_is_categorical=is_categorical_target_schema(df[target]),
+            target_name=target,
+        )
+    elif task_type == "regression" and not pd.api.types.is_numeric_dtype(df[target].dtype):
+        raise ValueError(
+            "Regression requires a numeric target. Choose classification or select a numeric target."
+        )
+
+    plan_data = {**args, "target_column": target, "task_type": task_type}
+    plan = create_plan(db, run_id=run.id, plan_json=plan_data, approval_status="pending")
+    emit_event(
+        db,
+        run.id,
+        "run.awaiting_approval",
+        step="awaiting_approval",
+        progress=int(run.progress_percent or 0),
+        message="The analysis plan is waiting for user approval.",
+        payload={"plan_id": plan.id},
+    )
     return {
         "status": "awaiting_approval",
         "plan_id": plan.id,
-        "message": f"I have proposed a plan to predict '{args['target_column']}' using {args['task_type']}. Please approve it to continue."
+        "target_column": target,
+        "task_type": task_type,
+        "message": f"I have proposed a plan to predict '{target}' using {task_type}. Please approve it to continue."
     }
 
 
@@ -571,6 +913,9 @@ def _tool_load_from_kaggle(session_id: str, args: dict, db: DBSession) -> dict:
     # Re-cache raw dataset for this session
     df = load_from_path(file_path)
     df.to_pickle(_session_dir(session_id) / "raw.pkl")
+    dataset_metadata = dict(session.dataset_meta) if isinstance(session.dataset_meta, dict) else {}
+    dataset_metadata.update(describe(df))
+    dataset_metadata["original_filename"] = file_path.name
     
     # Update session to reflect new source
     update_session(
@@ -578,6 +923,7 @@ def _tool_load_from_kaggle(session_id: str, args: dict, db: DBSession) -> dict:
         source_type="kaggle",
         source_path=str(file_path),
         name=f"{session.name} (Kaggle: {kaggle_ref})",
+        dataset_meta=dataset_metadata,
     )
     
     # Save provenance
@@ -596,6 +942,7 @@ def _tool_load_from_kaggle(session_id: str, args: dict, db: DBSession) -> dict:
         "status": "success",
         "message": f"Dataset '{kaggle_ref}' downloaded and cached ({len(df)} rows).",
         "shape": [int(df.shape[0]), int(df.shape[1])],
+        "loading_metadata": df.attrs.get("loading_metadata", {}),
     }
 
 
@@ -605,6 +952,7 @@ def _tool_rerun_pipeline(
     db: DBSession,
     run_id: str | None = None,
 ) -> dict:
+    _check_run_cancellation(run_id)
     requested_task_type = args.get("task_type")
     if requested_task_type is not None and requested_task_type not in {
         "classification", "regression", "auto"
@@ -636,16 +984,86 @@ def _tool_rerun_pipeline(
     target = session.target_column
     if not target:
         df = _load_raw(db, session_id)
-        target_info = auto_detect_target(df)
-        target = target_info["best"]
+        target_info = detect_target_column(df)
+        target = target_info["selected"]
         if not target:
-            raise ValueError(target_info["message"])
+            suggestions = [
+                item.get("column")
+                for item in target_info.get("candidates", [])
+                if isinstance(item, dict) and item.get("column")
+            ]
+            return {
+                "status": "needs_input",
+                "error": target_info["message"],
+                "error_type": "TargetSelectionRequired",
+                "target_candidates": suggestions,
+                "task_type": None,
+            }
         _tool_set_target_column(session_id, {"column": target}, db)
 
+    _check_run_cancellation(run_id)
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "profiling_started",
+            step="profiling",
+            progress=0,
+            message="Dataset profiling started.",
+        )
     eda_result = _tool_run_eda(session_id, {"target_column": target}, db)
-    if "error" in eda_result: return {"step": "eda", "error": eda_result["error"]}
+    if "error" in eda_result:
+        if run_id:
+            emit_event(
+                db,
+                run_id,
+                "profiling_failed",
+                step="profiling",
+                progress=0,
+                message="Dataset profiling failed.",
+            )
+        return {"step": "eda", "error": eda_result["error"]}
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "profiling_completed",
+            step="profiling",
+            progress=0,
+            message="Dataset profiling completed.",
+        )
+    _check_run_cancellation(run_id)
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "preprocessing_started",
+            step="preprocessing",
+            progress=0,
+            message="Preprocessing started.",
+        )
     prep_result = _tool_run_preprocessing(session_id, {"target_column": target}, db)
-    if "error" in prep_result: return {"step": "preprocessing", "error": prep_result["error"]}
+    if "error" in prep_result:
+        if run_id:
+            emit_event(
+                db,
+                run_id,
+                "preprocessing_failed",
+                step="preprocessing",
+                progress=0,
+                message="Preprocessing failed.",
+            )
+        return {"step": "preprocessing", "error": prep_result["error"]}
+    if run_id:
+        emit_event(
+            db,
+            run_id,
+            "preprocessing_completed",
+            step="preprocessing",
+            progress=0,
+            message="Preprocessing completed.",
+        )
+    _check_run_cancellation(run_id)
     train_result = _tool_train_models(
         session_id,
         {
@@ -658,9 +1076,23 @@ def _tool_rerun_pipeline(
         db,
         run_id=run_id,
     )
+    if train_result.get("status") == "cancelled":
+        return train_result
     if "error" in train_result: return {"step": "training", "error": train_result["error"]}
-    report_result = _tool_generate_report(session_id, {}, db)
-    if "error" in report_result: return {"step": "report", "error": report_result["error"]}
+    _check_run_cancellation(run_id)
+    report_result = _tool_generate_report(
+        session_id,
+        {
+            "report_type": args.get("report_type", "machine_learning_analysis"),
+            "language": args.get("language", "English"),
+        },
+        db,
+        run_id=run_id,
+    )
+    state = _load_state(session_id)
+    state["report_status"] = report_result.get("status", "failed")
+    state["pdf_status"] = report_result.get("pdf_status", "not_run")
+    _save_state(session_id, state)
 
     try:
         from app.db.models import User
@@ -672,12 +1104,17 @@ def _tool_rerun_pipeline(
     except Exception as exc:
         logger.error("Email notification failed: %s", exc)
 
+    report_succeeded = report_result.get("status") == "success"
     return {
-        "status": "success",
+        "status": "success" if report_succeeded else "partial_success",
+        "analysis_status": "success",
         "target": target,
         "task_type": train_result.get("task_type"),
         "best_model": train_result.get("best_model"),
         "report_path": report_result.get("report_path"),
+        "report_status": report_result.get("status", "failed"),
+        "pdf_status": report_result.get("pdf_status", "not_run"),
+        "report": report_result,
         "notebook_path": report_result.get("notebook_path"),
     }
 
@@ -704,13 +1141,33 @@ def execute_tool(
     arguments: dict[str, Any],
     db: DBSession,
     run_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
-    function = _DISPATCH.get(tool_name)
-    if function is None:
-        return {"ok": False, "tool": tool_name, "error": f"Unknown tool '{tool_name}'.", "error_type": "UnknownToolError"}
-
     try:
-        if tool_name in {"train_models", "rerun_pipeline"}:
+        arguments = validate_tool_arguments(tool_name, arguments)
+        function = _DISPATCH.get(tool_name)
+        if function is None:
+            return {
+                "ok": False,
+                "tool": tool_name,
+                "error": f"Unknown tool '{tool_name}'.",
+                "error_type": "UnknownToolError",
+            }
+        if user_id is not None:
+            session = get_session(db, session_id)
+            if session is None or str(session.user_id) != str(user_id):
+                raise PermissionError("Session not found for the authenticated user.")
+            if run_id is not None:
+                run = get_run(db, run_id)
+                if (
+                    run is None
+                    or str(run.session_id) != str(session_id)
+                    or str(run.requested_by) != str(user_id)
+                ):
+                    raise PermissionError("AnalysisRun not found for the authenticated session.")
+        if tool_name in {"train_models", "rerun_pipeline", "propose_plan", "generate_report"}:
+            if tool_name == "train_models":
+                arguments = dict(arguments)
             result = function(session_id, arguments, db, run_id=run_id)
         else:
             result = function(session_id, arguments, db)
@@ -721,4 +1178,25 @@ def execute_tool(
         return {"ok": True, "tool": tool_name, **result}
     except Exception as exc:
         logger.exception("Tool '%s' failed", tool_name)
-        return {"ok": False, "tool": tool_name, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__}
+        if isinstance(exc, PermissionError):
+            message = "This session or analysis run is not available to the authenticated user."
+        elif isinstance(exc, FileNotFoundError):
+            message = "The dataset file for this session is unavailable. Reopen the session or upload the dataset again."
+        elif isinstance(exc, MemoryError):
+            message = "The operation exceeded available memory. Reduce the dataset size or use the configured sampling limits."
+        elif isinstance(exc, TimeoutError):
+            message = "The operation timed out. Check its recorded status before requesting another run."
+        elif isinstance(exc, ToolValidationError):
+            message = str(exc)
+        elif isinstance(exc, (ValueError, TypeError)):
+            message = str(exc)
+        elif isinstance(exc, ModelRegistryPersistenceError):
+            message = str(exc)
+        else:
+            message = "The backend operation failed unexpectedly. Check the run status and server logs."
+        return {
+            "ok": False,
+            "tool": tool_name,
+            "error": message,
+            "error_type": type(exc).__name__,
+        }

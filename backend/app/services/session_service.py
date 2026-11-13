@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -15,7 +16,7 @@ import pandas as pd
 from sqlalchemy.orm import Session as DBSession
 
 from app.config import settings
-from app.core.data_loader import describe, load_from_bytes, load_from_url
+from app.core.data_loader import describe, load_from_bytes, load_from_path, load_from_url
 from app.db.crud import create_session
 from app.db.models import Session as SessionModel
 from app.core.connectors.kaggle import KaggleConnector
@@ -63,9 +64,10 @@ def create_session_from_upload(
     *,
     user_id: str,
     name: str,
-    content: bytes,
+    content: bytes | None = None,
     original_filename: str | None = None,
     filename: str | None = None,
+    temporary_path: str | Path | None = None,
     target_column: str | None = None,
     notes: str | None = None,
 ) -> SessionModel:
@@ -82,10 +84,18 @@ def create_session_from_upload(
     if safe_filename in {"", ".", ".."}:
         safe_filename = "data.csv"
 
-    df = load_from_bytes(content, safe_filename)
+    if (content is None) == (temporary_path is None):
+        raise ValueError("Provide exactly one of content or temporary_path.")
+    if temporary_path is not None:
+        df = load_from_path(temporary_path, format_hint=Path(safe_filename).suffix)
+    else:
+        df = load_from_bytes(content, safe_filename)
     session_id = str(uuid.uuid4())
     stored = settings.UPLOAD_DIR / f"{session_id}{Path(safe_filename).suffix.lower()}"
-    stored.write_bytes(content)
+    if temporary_path is not None:
+        shutil.copyfile(temporary_path, stored)
+    else:
+        stored.write_bytes(content)
     return _finish_create(
         db, user_id=user_id, name=name, source_type="upload", source_path=str(stored),
         df=df, target_column=target_column, notes=notes, forced_id=session_id,

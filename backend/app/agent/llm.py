@@ -6,8 +6,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -72,6 +70,35 @@ _PROVIDER_PREFIX = {
     "ollama": "ollama_chat/",
 }
 
+_OLLAMA_TOOL_MODEL_FAMILIES = {
+    "gpt-oss",
+    "qwen3",
+    "qwen2.5",
+    "qwen2.5-coder",
+    "llama3.1",
+    "llama4",
+    "devstral",
+}
+
+
+class AgentConfigurationError(RuntimeError):
+    """The configured Pipeline Agent model cannot satisfy its tool contract."""
+
+
+class MalformedAgentResponse(RuntimeError):
+    """The provider returned a malformed assistant or tool-call message."""
+
+
+def supports_native_tool_calling(provider: str, model: str) -> bool:
+    """Check known Ollama model families without downloading or contacting a provider."""
+    if provider.strip().lower() != "ollama":
+        return True
+    normalized = model.strip().lower()
+    if normalized.startswith("ollama_chat/"):
+        normalized = normalized.removeprefix("ollama_chat/")
+    family = normalized.split(":", 1)[0]
+    return family in _OLLAMA_TOOL_MODEL_FAMILIES
+
 
 def _value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -108,10 +135,10 @@ def normalize_tool_call(tool_call: Any, index: int = 0) -> dict[str, Any]:
         "arguments",
         _value(tool_call, "arguments", {}),
     )
-    call_id = _value(tool_call, "id") or f"call_{uuid.uuid4().hex[:12]}"
+    call_id = _value(tool_call, "id")
 
     return {
-        "id": str(call_id),
+        "id": str(call_id) if call_id is not None else "",
         "type": "function",
         "function": {
             "name": str(name),
@@ -207,18 +234,27 @@ async def chat(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str = "auto",
-    max_retries: int = 5,
+    max_retries: int = 2,
 ) -> Any:
     model = _resolve_model()
     kwargs = _build_kwargs()
 
     if tools:
+        if not supports_native_tool_calling(settings.LLM_PROVIDER, settings.LLM_MODEL):
+            raise AgentConfigurationError(
+                f"The configured Ollama model '{settings.LLM_MODEL}' is not in the "
+                "supported tool-calling model families. Configure an installed "
+                "Ollama model with native tool support; the Agent will not download one."
+            )
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
 
     request_messages = _normalise_messages(messages)
+    attempts = max(1, min(int(max_retries), 2))
+    kwargs["timeout"] = settings.AGENT_LLM_TIMEOUT_SECONDS
+    kwargs["num_retries"] = 0
 
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, attempts + 1):
         try:
             return await acompletion(
                 model=model,
@@ -226,93 +262,55 @@ async def chat(
                 **kwargs,
             )
         except Exception as exc:
-            error_text = str(exc)
-            is_rate_limit = (
-                "RateLimitError" in error_text
-                or "rate_limit_exceeded" in error_text
+            status_code = getattr(exc, "status_code", None)
+            retryable = (
+                isinstance(status_code, int)
+                and (status_code == 408 or status_code == 429 or status_code >= 500)
+            ) or any(
+                marker in type(exc).__name__.casefold()
+                for marker in ("timeout", "connect", "connection", "serviceunavailable")
             )
-
-            if is_rate_limit and attempt < max_retries:
-                match = re.search(
-                    r"Please try again in ([\d.]+)s",
-                    error_text,
-                )
-                wait_time = (
-                    float(match.group(1)) + 2
-                    if match
-                    else min(60, 15 * (2 ** (attempt - 1)))
-                )
-
-                await asyncio.sleep(wait_time)
+            if retryable and attempt < attempts:
+                await asyncio.sleep(0.5)
                 continue
 
-            logger.exception("LLM call failed")
+            logger.warning(
+                "Pipeline Agent model request failed (provider=%s model=%s error_type=%s attempt=%s)",
+                settings.LLM_PROVIDER,
+                settings.LLM_MODEL,
+                type(exc).__name__,
+                attempt,
+            )
+            if settings.LLM_PROVIDER.strip().lower() == "ollama":
+                detail = str(exc).casefold()
+                if "model" in detail and ("not found" in detail or "does not exist" in detail):
+                    raise AgentConfigurationError(
+                        f"Ollama does not have model '{settings.LLM_MODEL}' available. "
+                        "Install that model manually, then retry; the Agent will not download it."
+                    ) from None
+                if any(marker in type(exc).__name__.casefold() for marker in ("connect", "connection")):
+                    raise RuntimeError(
+                        "The local Ollama service is unavailable. Start Ollama and retry."
+                    ) from None
+                if "timeout" in type(exc).__name__.casefold():
+                    raise RuntimeError(
+                        "The local Ollama request timed out. Check the service and model load."
+                    ) from None
             raise RuntimeError(
-                f"LLM call failed ({model}): {exc}"
-            ) from exc
+                "The Pipeline Agent model request failed. Check the configured provider and model."
+            ) from None
 
-    raise RuntimeError(f"LLM call failed ({model}): retry limit exhausted")
-
-
-def _parse_json_payload(content: str) -> Any:
-    candidates = [content.strip()]
-    candidates.extend(
-        match.group(1).strip()
-        for match in re.finditer(
-            r"```(?:json)?\s*(.*?)\s*```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-    )
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-    object_match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-    if object_match:
-        try:
-            return json.loads(object_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return None
-
-
-def _fallback_tool_calls(content: str) -> list[dict[str, Any]] | None:
-    payload = _parse_json_payload(content)
-
-    if isinstance(payload, Mapping):
-        raw_calls = payload.get("tool_calls")
-        if raw_calls:
-            normalized = normalize_tool_calls(raw_calls)
-            if normalized:
-                return normalized
-
-        if payload.get("name") is not None and "arguments" in payload:
-            return normalize_tool_calls([payload])
-
-        function = payload.get("function")
-        if isinstance(function, Mapping):
-            if function.get("name") is not None:
-                return normalize_tool_calls([payload])
-
-    return None
+    raise RuntimeError("The Pipeline Agent model request stopped after its retry limit.")
 
 
 def extract_message(response: Any) -> dict[str, Any]:
     choices = _value(response, "choices")
     if not choices:
-        raise RuntimeError("Malformed LLM response: no choices")
+        raise MalformedAgentResponse("The model returned no response choices.")
 
     message = _value(choices[0], "message")
     if message is None:
-        raise RuntimeError("Malformed LLM response: missing message")
+        raise MalformedAgentResponse("The model response did not contain a message.")
 
     raw_content = _value(message, "content", "")
 
@@ -327,14 +325,16 @@ def extract_message(response: Any) -> dict[str, Any]:
             default=str,
         )
 
-    normalized_calls = normalize_tool_calls(
-        _value(message, "tool_calls")
-    )
-
-    if not normalized_calls:
-        normalized_calls = _fallback_tool_calls(content)
-        if normalized_calls:
-            content = ""
+    raw_calls = _value(message, "tool_calls")
+    normalized_calls = normalize_tool_calls(raw_calls)
+    if raw_calls is not None and not normalized_calls:
+        raise MalformedAgentResponse("The model returned malformed tool calls.")
+    for call in normalized_calls or []:
+        function = call.get("function") or {}
+        if not call.get("id") or not function.get("name"):
+            raise MalformedAgentResponse(
+                "A model tool call is missing its call ID or registered tool name."
+            )
 
     return {
         "content": content,

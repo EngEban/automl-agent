@@ -71,11 +71,11 @@ async def create_from_upload(
                     )
                 partial_file.write(chunk)
 
-        content = partial_path.read_bytes()
         obj = session_service.create_session_from_upload(
             db, user_id=current_user.id, name=name,
             original_filename=file.filename or "data.csv",
-            content=content, target_column=target_column, notes=notes,
+            temporary_path=partial_path,
+            target_column=target_column, notes=notes,
         )
     except HTTPException:
         raise

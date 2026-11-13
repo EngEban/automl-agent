@@ -52,6 +52,8 @@ def _patch_training(monkeypatch, tmp_path, *, run):
     )
     monkeypatch.setattr(executor, "get_session", lambda *_: session)
     monkeypatch.setattr(executor, "get_run", lambda *_: run)
+    monkeypatch.setattr(executor, "_check_run_cancellation", lambda *_: None)
+    monkeypatch.setattr(executor, "emit_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         executor.prep_mod,
         "prepare_xy_for_training",

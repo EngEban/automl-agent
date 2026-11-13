@@ -17,6 +17,7 @@ alembic==1.13.2
 
 # LLM (multi-provider: Groq, OpenAI, Anthropic, Google, Ollama)
 litellm==1.105.1
+langgraph==0.2.76
 
 # Data / ML
 pandas==2.2.2

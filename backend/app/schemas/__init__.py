@@ -8,6 +8,7 @@ from app.schemas.analysis import (
     TaskStatus,
 )
 from app.schemas.chat import (
+    AnalysisOptions,
     ChatRequest,
     ChatResponse,
     MessageRead,
@@ -23,7 +24,7 @@ from app.schemas.session import (
 __all__ = [
     "AnalyzeURLRequest", "TaskResponse", "TaskStatus",
     "SessionCreateURL", "SessionRead", "SessionListItem",
-    "ChatRequest", "ChatResponse", "MessageRead", "ToolCallRecord",
+    "AnalysisOptions", "ChatRequest", "ChatResponse", "MessageRead", "ToolCallRecord",
     "AgentConfig", "ToolInfo",
     "Ok", "Err",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import joblib
@@ -68,18 +69,60 @@ def run_inference(db: DBSession, model_version_id: str, records: list[dict]) -> 
         raise RuntimeError("Model artifact does not contain a fitted pipeline.")
 
     try:
-        df = pd.DataFrame(records)
+        available_cols = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise TypeError("Each prediction record must be an object.")
+            available_cols.update(record.keys())
     except (TypeError, ValueError) as exc:
         raise InvalidPredictionInput("Prediction records are invalid.") from exc
 
-    missing_cols = [c for c in expected_cols if c not in df.columns]
+    missing_cols = [c for c in expected_cols if c not in available_cols]
     if missing_cols:
         raise InvalidPredictionInput(
             f"Missing required columns for prediction: {missing_cols}"
         )
 
+    batch_size = int(settings.PREDICTION_BATCH_SIZE)
+    batch_count = math.ceil(len(records) / batch_size) if records else 0
+    logger.info(
+        "Processing %d prediction rows in %d batches (batch size %d)",
+        len(records),
+        batch_count,
+        batch_size,
+    )
+    predictions: list = []
+    probabilities: list[list[float]] | None = None
+    model = getattr(pipeline, "named_steps", {}).get("model")
+    has_probabilities = callable(getattr(model, "predict_proba", None))
+    if has_probabilities:
+        probabilities = []
+
     try:
-        preds = pipeline.predict(df[expected_cols])
+        for start in range(0, len(records), batch_size):
+            batch_records = records[start : start + batch_size]
+            batch = pd.DataFrame(batch_records).reindex(columns=expected_cols)
+            preds, probs = _predict_batch(pipeline, batch, model)
+            if target_encoder is not None:
+                try:
+                    preds = target_encoder.inverse_transform(np.asarray(preds))
+                except Exception as exc:
+                    logger.exception(
+                        "Model returned invalid encoded targets for model version %s",
+                        model_version_id,
+                    )
+                    raise RuntimeError("Model produced invalid encoded predictions.") from exc
+            predictions.extend(
+                value.item() if isinstance(value, np.generic) else value
+                for value in preds
+            )
+            if probabilities is not None and probs is not None:
+                probabilities.extend(np.asarray(probs).tolist())
+    except RuntimeError as exc:
+        if str(exc) == "Model produced invalid encoded predictions.":
+            raise
+        logger.exception("Inference failed for model version %s", model_version_id)
+        raise RuntimeError("Inference failed.") from exc
     except ValueError as exc:
         logger.info("Prediction input rejected for model version %s: %s", model_version_id, exc)
         raise InvalidPredictionInput(
@@ -89,32 +132,10 @@ def run_inference(db: DBSession, model_version_id: str, records: list[dict]) -> 
         logger.exception("Inference failed for model version %s", model_version_id)
         raise RuntimeError("Inference failed.") from exc
 
-    if target_encoder is not None:
-        try:
-            preds = target_encoder.inverse_transform(np.asarray(preds))
-        except Exception as exc:
-            logger.exception(
-                "Model returned invalid encoded targets for model version %s",
-                model_version_id,
-            )
-            raise RuntimeError("Model produced invalid encoded predictions.") from exc
-
     try:
-        probs = None
-        # sklearn orders probability columns by encoded class. LabelEncoder maps
-        # those indices to classes_ in the same order, so leave probabilities
-        # in their pipeline order when restoring the returned labels.
-        if hasattr(pipeline.named_steps["model"], "predict_proba"):
-            probs = pipeline.predict_proba(df[expected_cols]).tolist()
-
-        predictions = [
-            value.item() if isinstance(value, np.generic) else value
-            for value in preds
-        ]
-
         return PredictResponse(
             predictions=predictions,
-            probabilities=probs,
+            probabilities=probabilities,
             model_version_id=model_version.id,
             model_name=model_version.model_name,
         )
@@ -126,3 +147,27 @@ def run_inference(db: DBSession, model_version_id: str, records: list[dict]) -> 
     except Exception as exc:
         logger.exception("Inference failed for model version %s", model_version_id)
         raise RuntimeError("Inference failed.") from exc
+
+
+def _predict_batch(pipeline, batch: pd.DataFrame, model):
+    """Transform once and reuse that representation for predictions and scores."""
+    steps = getattr(pipeline, "steps", None)
+    if steps and len(steps) > 1 and steps[-1][0] == "model":
+        transformed = pipeline[:-1].transform(batch)
+        predictions = model.predict(transformed)
+        probabilities = (
+            model.predict_proba(transformed)
+            if callable(getattr(model, "predict_proba", None))
+            else None
+        )
+        return predictions, probabilities
+
+    predictions = pipeline.predict(batch)
+    if not callable(getattr(model, "predict_proba", None)):
+        return predictions, None
+    pipeline_predict_proba = getattr(pipeline, "predict_proba", None)
+    if callable(pipeline_predict_proba):
+        probabilities = pipeline_predict_proba(batch)
+    else:
+        probabilities = model.predict_proba(batch)
+    return predictions, probabilities
