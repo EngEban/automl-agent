@@ -1,96 +1,56 @@
-# 🤖 AutoML Agent
+# AutoML Agent
 
-An intelligent, autonomous AI Agent that automates the entire Data Science lifecycle. Upload a dataset, and the agent will perform EDA, clean the data, train multiple models, select the best one, and generate a professional PDF report along with a reproducible Jupyter Notebook.
+AutoML Agent is a session-based data analysis backend. It profiles datasets, prepares and evaluates models, records analysis runs, and produces reports and reusable model artifacts.
 
-## ✨ Features
-- **Autonomous Agent:** Powered by LLMs (via Ollama, OpenAI, or Groq) using function calling to decide the best analysis path.
-- **Smart Preprocessing:** Automatically handles missing values, categorical encoding, and feature scaling.
-- **AutoML Pipeline:** Trains and compares multiple models (Random Forest, Gradient Boosting, etc.).
-- **Rich Reporting:** Generates a polished PDF report with insights, charts, and model comparisons.
-- **Reproducible Code:** Generates a ready-to-run `.ipynb` Jupyter Notebook.
-- **Secure Authentication:** JWT-based authentication with Google OAuth and Email Verification.
-- **Notifications:** Real-time Web Push notifications and Email alerts upon completion.
+## Backend capabilities
 
-## 🛠️ Tech Stack
-- **Backend:** FastAPI, Python 3.11, SQLAlchemy, PostgreSQL.
-- **AI/Agent:** LiteLLM, Ollama (Local LLM), LangChain concepts.
-- **Machine Learning:** Pandas, Scikit-learn, Matplotlib, Seaborn.
-- **Authentication:** JWT, Passlib, Python-Jose, Google OAuth2.
-- **Reporting:** WeasyPrint (PDF), nbformat (Jupyter).
-- **Frontend:** React, Vite, Tailwind CSS *(Coming soon)*.
+- FastAPI endpoints for authentication, datasets, chat, runs, SSE events, artifacts, and predictions.
+- Separate Simple and Advanced Pipeline Agent modes, with bounded tools and run lifecycle controls.
+- Dataset profiling, target/task inference, leakage-aware preprocessing and evaluation, sampling, and memory safeguards.
+- Independent LangGraph Report Agent with separate Groq configuration and a retained legacy report fallback.
+- PostgreSQL persistence, Alembic migrations, and Celery/Redis background execution.
 
-## 🚀 Getting Started
+## Technology
 
-### Prerequisites
+- Backend: FastAPI, Pydantic, SQLAlchemy, PostgreSQL, Celery, and Redis.
+- Pipeline Agent: LiteLLM and the configured provider.
+- Report Agent: LangGraph, LiteLLM, and its separate provider settings.
+- Data and ML: pandas, NumPy, SciPy, scikit-learn, and Optuna.
+- PDF and notebook artifacts: Jinja2 and Playwright for PDF rendering; the core code generator creates notebook source.
+- Authentication and notifications: JWT, Google OAuth code exchange, Passlib, Python-Jose, and Resend.
 
-- Python 3.11+
-- Docker Desktop with Compose v2
-- Ollama (for a local LLM) or an API key for Groq/OpenAI
+The frontend foundation and design-system preview are in [frontend](frontend/README.md). Full product pages are planned for later tasks. See [Architecture](docs/ARCHITECTURE.md), [API reference](docs/API.md), [Agent workflows](docs/AGENT.md), and [Setup](docs/SETUP.md).
 
-### Docker Compose
+## Docker Compose
 
-The default Compose stack contains PostgreSQL, Redis, the FastAPI backend, a
-Celery worker, and a one-shot migration service. Frontend services are not part
-of the default stack yet.
+The Compose file defines PostgreSQL and Redis alongside application, worker, and migration services. To start only local infrastructure, create .env only if it is absent, then run from the repository root:
 
-```bash
-copy .env.example .env  # Windows
-# cp .env.example .env  # macOS/Linux; then edit the values
-docker compose --env-file .env -f docker/docker-compose.yml up --build
-```
+    if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+    docker compose --env-file .env -f docker/docker-compose.yml up -d postgres redis
 
-The migration service waits for PostgreSQL to become healthy. The backend and
-worker start only after `alembic upgrade head` succeeds. PostgreSQL data is
-stored in the `postgres_data` volume, Redis data in `redis_data`, and backend
-artifacts in `backend/storage`.
+Stop only the infrastructure services while preserving their data with:
 
-The API is available at http://localhost:8100/docs.
+    docker compose --env-file .env -f docker/docker-compose.yml stop postgres redis
 
-### Local backend development
+Do not use `down -v`; it removes the named database and Redis volumes. These commands do not start the API, worker, migrations, or frontend.
 
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cd ..
-```
+## Local backend setup
 
-Copy `.env.example` to `.env`, start PostgreSQL and Redis, and use the host
-URLs in `.env`. From the repository root, run the migrations and application:
+Use Python 3.11 or later. From the repository root, create .env only if one does not already exist:
 
-```bash
-alembic -c backend/alembic.ini upgrade head
-uvicorn app.main:app --app-dir backend --reload --port 8100
-```
+    # PowerShell
+    if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-### Alembic commands
+Configure PostgreSQL and Redis URLs, CORS, and the separate Pipeline and Report Agent settings. Keep real credentials in .env; never copy example placeholders over an existing configuration.
 
-```bash
-# Apply all migrations to a fresh database
-alembic -c backend/alembic.ini upgrade head
+    cd backend
+    python -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    python -m pip install -r requirements.txt
+    cd ..
+    alembic -c backend/alembic.ini upgrade head
+    uvicorn app.main:app --app-dir backend --reload --port 8100
 
-# Inspect the current database revision
-alembic -c backend/alembic.ini current
+The API is available at http://localhost:8100/docs. Local runtime requires PostgreSQL and Redis. The automated test suite does not require live LLM endpoints.
 
-# List the migration history
-alembic -c backend/alembic.ini history
-```
-
-Migration `0001_initial_schema` is the original five-table baseline. Migration
-`0002_analysis_runs` adds `analysis_runs` and `run_events`.
-
-#### Existing databases created by the old application
-
-Do not stamp or reset an existing database automatically. First take a backup,
-then verify that its `users`, `sessions`, `messages`, `operations`, and
-`artifacts` tables match `0001_initial_schema` (columns, types, nullability,
-foreign keys, indexes, and unique constraints). Only after that verification:
-
-```bash
-alembic -c backend/alembic.ini stamp 0001_initial_schema
-alembic -c backend/alembic.ini upgrade head
-```
-
-The stamp records the verified baseline without changing application tables;
-the upgrade then applies only the new run lifecycle tables.
+For tests, checks, and migration adoption safety, follow [Setup](docs/SETUP.md).

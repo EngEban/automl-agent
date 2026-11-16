@@ -10,7 +10,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DBSession
 
 from app.core.run_lifecycle import InvalidRunTransition, transition_run_status
-from app.db import crud
 from app.db.models import AnalysisRun, RunEvent
 from app.db.session import SessionLocal
 

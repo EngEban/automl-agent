@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from sklearn.preprocessing import LabelEncoder
 
-from app.agent import executor
+from backend.app.agents.ml_pipeline_agent import executor
 
 
 def _training_result() -> dict:

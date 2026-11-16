@@ -178,7 +178,7 @@ def test_invalid_explicit_target_values_fail_with_actionable_error(values, error
 
 
 def test_agent_rerun_surfaces_ambiguous_target_candidates(monkeypatch):
-    from app.agent import executor
+    from backend.app.agents.ml_pipeline_agent import executor
 
     session = type("Session", (), {"target_column": None})()
     frame = pd.DataFrame(
@@ -198,7 +198,7 @@ def test_agent_rerun_surfaces_ambiguous_target_candidates(monkeypatch):
 
 
 def test_agent_training_surfaces_ambiguous_numeric_task_type(monkeypatch):
-    from app.agent import executor
+    from backend.app.agents.ml_pipeline_agent import executor
 
     session = type("Session", (), {"id": "session-1", "target_column": "target"})()
     frame = pd.DataFrame(
@@ -234,7 +234,7 @@ def test_agent_training_surfaces_ambiguous_numeric_task_type(monkeypatch):
 
 
 def test_agent_rerun_rejects_an_unsupported_explicit_task_type():
-    from app.agent import executor
+    from backend.app.agents.ml_pipeline_agent import executor
 
     result = executor.execute_tool(
         "session-1", "rerun_pipeline", {"task_type": "clustering"}, object()

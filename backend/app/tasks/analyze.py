@@ -16,7 +16,7 @@ from app.core.model_selector import detect_target_column, is_categorical_target_
 from app.core.memory import estimate_dataframe_memory
 from app.core.preprocessing import build_preprocessor, prepare_xy_for_training
 from app.core.trainer import train_and_evaluate
-from app.worker import celery_app
+from backend.app.worker.worker import celery_app
 
 logger = logging.getLogger(__name__)
 

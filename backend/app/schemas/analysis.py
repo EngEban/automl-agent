@@ -1,7 +1,7 @@
 """Pydantic schemas for API."""
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 

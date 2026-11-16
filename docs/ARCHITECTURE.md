@@ -1,86 +1,51 @@
-# AutoML Agent - Architecture
+# Backend architecture
 
-## Overview
-AutoML Agent is designed using a modular, scalable architecture. The system separates the core Machine Learning pipeline from the AI Agent and the API layer, ensuring loose coupling and high maintainability.
+## Runtime entry points
 
-## Core Components
+- app.main:app creates the FastAPI application and mounts app.api.router at /api.
+- app.worker.worker:celery_app is the Celery entry point. Its explicit task include list registers the legacy analyze_dataset task and the current run_agent_task.
+- Alembic migrations are the only schema upgrade path. Application import does not call create_all().
 
-1. **API Layer (FastAPI)**:
-   - Handles HTTP requests, CORS, and routing.
-   - Manages authentication (JWT, Google OAuth) and authorization.
-   - Interacts with the database using SQLAlchemy.
+Settings are loaded through Pydantic Settings. Importing the app creates the SQLAlchemy engine and Celery objects and ensures storage directories, but does not connect to PostgreSQL or Redis. Kaggle API authentication is deferred until a connector instance is created. LLM and email network calls occur only when the corresponding operation is invoked.
 
-2. **AI Agent (`app/agent/`)**:
-   - The "brain" of the application. It uses **LiteLLM** to communicate with the LLM (e.g., Ollama/Qwen).
-   - Maintains conversation memory and context window.
-   - Decides which tools to call based on the user's prompt.
-   - Parses tool calls and passes them to the Executor.
+## Package responsibilities
 
-3. **Core ML Pipeline (`app/core/`)**:
-   - Pure Python/Scikit-learn logic. 
-   - Contains modules for Data Loading, EDA, Preprocessing, Training, and Report Generation.
-   - It knows nothing about the LLM or HTTP; it simply takes a DataFrame and returns results.
+| Package | Responsibility |
+| --- | --- |
+| app/api/routes and app/schemas | FastAPI endpoints, authentication dependencies, request validation, and response contracts. |
+| app/agent | Ollama-capable Pipeline Agent: request planning, tool schemas, validation, execution, and conversation memory. |
+| app/agents/report_agent | Independent Groq and LangGraph report workflow, report validation, facts, HTML rendering, and PDF orchestration. |
+| app/core | Dataset loading and profiling, EDA, target/task inference, preprocessing, training, memory guards, code generation, and run lifecycle helpers. |
+| app/services | Session, authentication, inference, notification, and run orchestration. |
+| app/tasks | Celery tasks for the retained legacy analysis flow and current run-based Agent flow. |
+| app/db and alembic | SQLAlchemy models and CRUD plus the append-only migration history. |
+| backend/storage | Runtime uploads, session caches, figures, reports, and model artifacts. Treat its existing contents as user data. |
 
-4. **Database (`app/db/`)**:
-   - PostgreSQL managed via SQLAlchemy and Alembic.
-   - Stores `Users`, `Sessions`, `Messages`, `Operations`, `Artifacts`,
-     `AnalysisRuns`, and `RunEvents`.
-   - The application does not call `Base.metadata.create_all()` at startup;
-     schema creation and updates are explicit Alembic migrations.
+## Request and execution flow
 
-5. **Notifications & Storage**:
-   - Generates PDFs using WeasyPrint and Jupyter Notebooks using `nbformat`.
-   - Stores artifacts locally and notifies users via Email (Resend) and Web Push.
+1. The user creates an owned dataset session through a URL, upload, or Kaggle operation.
+2. A chat request validates Simple or Advanced mode, creates an AnalysisRun, and records initial events.
+3. The API queues run_agent_task; the worker executes a bounded Pipeline Agent turn with the run and owner context.
+4. The allowlisted tools call the shared profiling, EDA, preprocessing, training, registry, prediction, and report services.
+5. Run events are persisted with stable ordering. Clients can resume the SSE stream using an event ID or page through event history.
+6. Cancellation is recorded and observed at safe checkpoints. Completed results remain available if a later step fails.
 
-## Database infrastructure
+Simple mode does not accept analysis options. Advanced mode can supply a validated target column and task type; plans requiring approval are resumed through the run approval endpoint.
 
-The default Docker Compose stack contains four long-running application
-services plus a one-shot migration service:
+## Agents and provider boundaries
 
-```text
-PostgreSQL 16 (postgres:5432) ──> migrate (alembic upgrade head)
-          │                                  │
-          └───────────────┬──────────────────┘
-                          ▼
-                 FastAPI backend + Celery worker
+The Pipeline Agent reads its own LLM_* settings through LiteLLM. The Report Agent has independent REPORT_LLM_* settings and a LangGraph workflow. When the Report Agent is disabled, the report service retains the legacy fallback in app/core/report_generator.py; that module and its artifact compatibility path are intentionally preserved.
 
-Redis 7 (redis:6379) ────────> backend and worker
-```
+Both report paths use Jinja2 and Playwright for PDF generation. Notebook source is generated by the core code generator. Email verification and completion email delivery use Resend; the API also stores browser push subscriptions.
 
-PostgreSQL and Redis use health checks. The migration service waits for a
-healthy PostgreSQL server, and the backend and worker wait for the migration
-service to complete successfully. PostgreSQL and Redis use named persistent
-volumes; backend-generated files remain in `backend/storage`.
+Import tests and the automated suite use mocks or local test databases. The scripts smoke_test_ollama_pipeline.py and smoke_test_report_agent.py are explicit live-provider diagnostics and are not part of pytest.
 
-## Migration history and safety
+## Database and migrations
 
-- `0001_initial_schema` reconstructs the original five-table schema that was
-  previously created by SQLAlchemy `create_all()`.
-- `0002_analysis_runs` adds `analysis_runs` and `run_events`, including their
-  foreign keys and indexes.
+The current SQLAlchemy model set has 11 tables: users, sessions, messages, operations, artifacts, analysis_runs, run_events, experiments, model_versions, analysis_plans, and dataset_sources.
 
-Fresh installations use:
+The migration chain is 0001_initial_schema -> 0002_analysis_runs -> b3ee8c7dbb01_add_model_registry_tables -> 18cd42a0a3f0_add_dataset_sources_table -> f7a4c12d8e90_run_event_order_and_idempotency. The last revision adjusts event ordering and run idempotency; it does not replace the earlier schema. Never edit or delete applied migration history as part of routine cleanup.
 
-```bash
-alembic -c backend/alembic.ini upgrade head
-```
+## Runtime data
 
-For a database created by the old application, back it up and verify the
-five-table schema against revision `0001_initial_schema` before recording the
-baseline with `alembic -c backend/alembic.ini stamp 0001_initial_schema`.
-Only then run `alembic -c backend/alembic.ini upgrade head`. This adoption
-procedure is manual by design and never runs automatically.
-
-Inspect the applied revision with:
-
-```bash
-alembic -c backend/alembic.ini current
-```
-
-## Data Flow
-1. The user uploads a dataset via the API.
-2. The agent receives a prompt and analyzes the dataset schema.
-3. The agent decides on a sequence of tools (e.g., EDA -> Preprocessing -> Training).
-4. The `executor.py` triggers the Core ML Pipeline.
-5. The pipeline saves artifacts to the local storage and updates the database.
-6. The agent returns the final response to the user.
+The backend/storage tree is application state, not disposable build output. Cleanup and test routines must not remove uploaded datasets, reports, figures, session caches, database records, or model artifacts.

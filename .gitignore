@@ -23,6 +23,9 @@ backend/storage/models/*
 node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/.next/
+frontend/out/
+frontend/coverage/
 
 # OS / Editors
 .DS_Store

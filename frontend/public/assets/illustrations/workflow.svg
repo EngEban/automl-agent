@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 230" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Machine learning workflow foundation</title>
+  <desc id="desc">Three connected stages represent data preparation, model evaluation, and a reusable result.</desc>
+  <path d="M127 115h78m83 0h25" stroke="#CBD5E1" stroke-width="3" stroke-linecap="round" stroke-dasharray="6 7"/>
+  <rect x="28" y="65" width="99" height="100" rx="20" fill="#fff" stroke="#DBE4F0" stroke-width="2"/>
+  <rect x="171" y="65" width="118" height="100" rx="20" fill="#fff" stroke="#DBE4F0" stroke-width="2"/>
+  <rect x="316" y="65" width="96" height="100" rx="20" fill="#fff" stroke="#DBE4F0" stroke-width="2"/>
+  <rect x="58" y="88" width="38" height="30" rx="8" fill="#EFF6FF"/>
+  <path d="M67 108v-9m10 9V94m10 14v-5" stroke="#3B82F6" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M49 132h57" stroke="#CBD5E1" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="230" cy="101" r="18" fill="#F5F3FF"/>
+  <path d="M230 90v22m-11-11h22m-19-8 16 16m0-16-16 16" stroke="#8B5CF6" stroke-width="2" stroke-linecap="round"/>
+  <path d="M197 137h67" stroke="#CBD5E1" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="364" cy="102" r="19" fill="#EFF6FF"/>
+  <path d="m355 102 6 6 12-13" stroke="#3B82F6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M341 137h46" stroke="#CBD5E1" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="154" cy="115" r="4" fill="#8B5CF6"/>
+  <circle cx="300" cy="115" r="4" fill="#3B82F6"/>
+</svg>

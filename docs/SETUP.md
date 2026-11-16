@@ -1,104 +1,86 @@
-# Local Setup Guide
+# Local setup and verification
 
-## Prerequisites
+## Requirements
 
-- Python 3.11+
-- Docker Desktop with Compose v2
-- Ollama (for a local LLM) or an API key for Groq/OpenAI
+- Python 3.11 or later.
+- PostgreSQL and Redis for the full API and worker runtime.
+- An Ollama endpoint or another supported LiteLLM provider for live Pipeline Agent requests.
+- Groq credentials only if live Report Agent generation is enabled.
 
-## Recommended setup: Docker Compose
+The backend can be imported and its automated tests can run without PostgreSQL, Redis, Kaggle credentials, or live LLM requests.
+
+## Environment
+
+Create .env from .env.example only if .env does not already exist. Preserve existing .env files and never put real credentials in .env.example.
+
+PowerShell:
+
+    if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+
+Configure the host-side DATABASE_URL, optional Compose DATABASE_URL_DOCKER, POSTGRES_* values, Redis URLs, CORS origins, and the two separate agent configurations. REPORT_AGENT_ENABLED defaults to false; provide a valid Report Agent key before enabling live Groq generation. The Next.js frontend has its own non-secret NEXT_PUBLIC_API_BASE_URL setting in frontend/.env.example.
+
+Percent-encode URL-reserved characters in database passwords inside both database URLs; for example, encode @ as %40.
+
+## Docker Compose development
+
+The existing Compose file also defines application, worker, and migration services. For local infrastructure checks, select only PostgreSQL and Redis so no application containers or migrations start. From the repository root, create .env only when it is absent, then run:
+
+    docker compose --env-file .env -f docker/docker-compose.yml up -d postgres redis
+
+Stop only those services without removing their named data volumes with:
+
+    docker compose --env-file .env -f docker/docker-compose.yml stop postgres redis
+
+Do not use `down -v`; it deletes the persistent PostgreSQL and Redis volumes. The service ports are bound to localhost only.
+
+## Python environment
 
 From the repository root:
 
-```powershell
-Copy-Item .env.example .env
-# Edit .env before starting if you need non-default credentials or services.
-docker compose --env-file .env -f docker/docker-compose.yml up --build
-```
+    cd backend
+    python -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    python -m pip install -r requirements.txt
 
-The stack starts PostgreSQL 16, Redis 7, the FastAPI backend, the Celery
-worker, and a one-shot Alembic migration service. PostgreSQL and Redis are
-reachable from containers as `postgres:5432` and `redis:6379`; host tools use
-`localhost:5433` and `localhost:6479`.
+Start the local API after configuring PostgreSQL and Redis:
 
-The migration service runs `alembic upgrade head` after PostgreSQL is healthy.
-The backend and worker are held until that service exits successfully. No
-frontend service is included in the default Compose file.
+    alembic -c backend/alembic.ini upgrade head
+    uvicorn app.main:app --app-dir backend --reload --port 8100
 
-To stop the stack without deleting database data:
+Open /docs for interactive OpenAPI documentation. The Celery application object is `app.worker.worker:celery_app`. Start a local worker from the backend directory with `celery -A app.worker.worker:celery_app worker --pool=solo --loglevel=info` on Windows.
 
-```powershell
-docker compose --env-file .env -f docker/docker-compose.yml down
-```
+## Migration history
 
-Do not use `docker compose down -v` unless you intentionally want to delete
-the named PostgreSQL and Redis volumes.
+Fresh databases are migrated through alembic upgrade head. The current model set contains 11 tables. The revision chain is:
 
-## Environment variables
+1. 0001_initial_schema: original users, sessions, messages, operations, and artifacts.
+2. 0002_analysis_runs: analysis runs and run events.
+3. b3ee8c7dbb01_add_model_registry_tables: experiments and model versions.
+4. 18cd42a0a3f0_add_dataset_sources_table: dataset sources and analysis plans.
+5. f7a4c12d8e90_run_event_order_and_idempotency: stable event pagination and run idempotency changes.
 
-Copy `.env.example` to `.env` and configure at least:
+For a database created by the pre-Alembic application:
 
-- `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`
-- `DATABASE_URL` for host-side commands
-- `DATABASE_URL_DOCKER` for services inside Compose
-- LLM settings appropriate for your provider
-- OAuth and email settings if those features are enabled
+1. Back it up and confirm the backup can be restored.
+2. Compare the original five tables against 0001_initial_schema, including column types, nullability, indexes, foreign keys, and unique constraints.
+3. Only after that verification, run the stamp and upgrade commands from the repository root:
 
-Database passwords containing URL-reserved characters must be percent-encoded
-inside both database URLs. For example, `@` becomes `%40`.
+       alembic -c backend/alembic.ini stamp 0001_initial_schema
+       alembic -c backend/alembic.ini upgrade head
 
-## Local Python development
+The upgrade applies the remaining six tables and later indexes/columns. Never stamp, drop, or reset an unverified database.
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-cd ..
-```
+## Automated tests and checks
 
-With PostgreSQL and Redis running and the host URLs configured in `.env`:
+Run these from the backend directory. The tests use mocks and local test databases; they do not make live Ollama or Groq requests.
 
-```powershell
-alembic -c backend/alembic.ini upgrade head
-uvicorn app.main:app --app-dir backend --reload --port 8100
-```
+    $env:LITELLM_LOCAL_MODEL_COST_MAP = 'True'
+    .\.venv\Scripts\python.exe -m pytest -q
+    .\.venv\Scripts\python.exe -m compileall -q app tests scripts
+    .\.venv\Scripts\python.exe -m pip check
 
-The API is available at http://localhost:8100/docs.
+The live diagnostics in scripts/smoke_test_ollama_pipeline.py and scripts/smoke_test_report_agent.py are separate from pytest. Run them only when a live provider check is intended; the Report Agent script can make Groq requests.
 
-## Database migrations
+## Runtime data
 
-Run Alembic from the repository root:
-
-```powershell
-alembic -c backend/alembic.ini upgrade head
-alembic -c backend/alembic.ini current
-alembic -c backend/alembic.ini history
-```
-
-For a fresh database, `upgrade head` creates all seven application tables.
-The revisions are:
-
-- `0001_initial_schema`: `users`, `sessions`, `messages`, `operations`, and `artifacts`
-- `0002_analysis_runs`: `analysis_runs` and `run_events`
-
-### Safely adopting an existing database
-
-The old application could have created the first five tables with
-`Base.metadata.create_all()`. Never run `stamp` against an unverified database.
-
-1. Back up the database and confirm the backup can be restored.
-2. Inspect the existing five-table schema and compare it to
-   `backend/alembic/versions/0001_initial_schema.py`: column types,
-   nullability, indexes, foreign keys, and unique constraints must match.
-3. On the verified database only, record the baseline and apply the new
-   migration:
-
-   ```powershell
-   alembic -c backend/alembic.ini stamp 0001_initial_schema
-   alembic -c backend/alembic.ini upgrade head
-   ```
-
-The stamp does not alter application tables. `upgrade head` then creates only
-the two analysis-run tables. If the schema does not match, stop and reconcile
-it manually; do not drop tables or records.
+Do not remove or reset backend/storage, PostgreSQL volumes, user datasets, reports, figures, session caches, or model artifacts as part of routine setup or verification.

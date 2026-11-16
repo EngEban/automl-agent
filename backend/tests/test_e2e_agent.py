@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.agent import agent as agent_module
-from app.agent.llm import extract_message
+from backend.app.agents.ml_pipeline_agent import agent as agent_module
+from backend.app.agents.ml_pipeline_agent.llm import extract_message
 
 
 class _NoopToolSession:

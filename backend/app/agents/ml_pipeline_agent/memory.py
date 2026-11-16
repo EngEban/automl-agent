@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session as DBSession
 
-from app.agent.llm import normalize_tool_calls
+from backend.app.agents.ml_pipeline_agent.llm import normalize_tool_calls
 from app.db.crud import list_messages
 from app.db.models import Message
 

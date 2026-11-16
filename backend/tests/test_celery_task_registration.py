@@ -1,4 +1,4 @@
-from app.worker import celery_app
+from backend.app.worker.worker import celery_app
 
 
 def test_run_agent_task_is_registered_with_worker() -> None:

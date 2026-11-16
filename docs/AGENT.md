@@ -1,25 +1,28 @@
-# The AutoML Agent
+# Agent workflows
 
-## What is it?
-The AutoML Agent is an autonomous AI entity powered by Large Language Models (LLMs). Instead of manually writing code, the user simply asks the agent to "Analyze this dataset" or "Predict the price", and the agent figures out the steps.
+## Pipeline Agent
 
-## Tools Available
-The agent has access to the following tools (defined in `app/agent/tools.py`):
-1. `inspect_dataset`: Reads the schema, columns, and sample rows.
-2. `run_eda`: Generates exploratory data analysis.
-3. `run_preprocessing`: Handles missing values, scaling, and encoding.
-4. `train_models`: Trains and compares multiple models.
-5. `generate_report`: Creates the PDF and Notebook.
-6. `set_target_column`: Changes the target variable.
-7. `rerun_pipeline`: Runs the entire process end-to-end.
+The Pipeline Agent lives in app/agent and uses LiteLLM with the independent LLM_* settings. It is invoked asynchronously through the chat and run APIs: the request creates an AnalysisRun, Celery executes it, and persisted events are available through SSE and event history.
 
-## The Agent Loop (`agent.py`)
-1. User sends a message.
-2. The agent sends the conversation + tool schemas to the LLM.
-3. If the LLM responds with a tool call, the agent executes it (`executor.py`).
-4. The result is appended to the conversation memory.
-5. The loop repeats until the LLM returns a final text response.
+Simple mode accepts a user message without analysis options. Advanced mode also accepts a target column and task type. Tool schemas are allowlisted, arguments are validated before execution, and per-run iteration and tool-call limits bound the loop. Approval-required plans are not run until the owner approves them.
 
-## Safety & Reliability
-- **Loop Breaker**: If a tool fails twice consecutively, the agent stops and reports the error, preventing infinite loops.
-- **Token Management**: The conversation history is truncated to fit the LLM's context window.
+The registered tools are:
+
+- Read state: get_session_status, inspect_dataset, get_operations_log.
+- Analyze and prepare: run_eda, run_preprocessing, set_target_column.
+- Train and retrieve results: train_models.
+- Orchestrate: propose_plan, rerun_pipeline, generate_report, load_from_kaggle.
+
+The executor calls the shared ML services and Model Registry. Dataset sampling, training-only task inference, train-fold preprocessing, independent holdout evaluation, memory limits, target encoding, prediction artifact compatibility, and ownership checks remain enforced in their respective services.
+
+Tool failures are returned as structured results. A completed tool result is preserved if a later model response or operation fails; run status and events distinguish success, partial completion, failure, cancellation, and approval/input waits.
+
+## Report Agent
+
+The Report Agent lives in app/agents/report_agent and remains independent from the Pipeline Agent. It builds a compact fact payload from completed results, runs a bounded LangGraph generation and validation workflow, and renders HTML/PDF artifacts. It reads REPORT_LLM_* settings; changing Pipeline Agent settings does not select its provider or model.
+
+When REPORT_AGENT_ENABLED is false, app/agents/report_agent/service.py retains the legacy app/core/report_generator.py fallback. Keep this fallback and compatible artifact loading paths until downstream consumers have been checked.
+
+## Verification
+
+Automated Report Agent and Pipeline Agent tests mock provider calls. The scripts scripts/smoke_test_ollama_pipeline.py and scripts/smoke_test_report_agent.py make live requests when intentionally run and must not be called from pytest. The Report Agent script can contact Groq; the Pipeline script uses the configured Ollama endpoint. Do not infer live provider success from mocked tests.

@@ -10,17 +10,17 @@ from typing import Any
 from sqlalchemy.orm import Session as DBSession
 from starlette.concurrency import run_in_threadpool
 
-from app.agent import executor
-from app.agent.llm import (
+from backend.app.agents.ml_pipeline_agent import executor
+from backend.app.agents.ml_pipeline_agent.llm import (
     AgentConfigurationError,
     MalformedAgentResponse,
     chat,
     extract_message,
 )
-from app.agent.memory import format_tool_result, load_history
-from app.agent.planning import RequestPlan, prepare_request_plan
-from app.agent.prompts import build_system_prompt
-from app.agent.tools import (
+from backend.app.agents.ml_pipeline_agent.memory import format_tool_result, load_history
+from backend.app.agents.ml_pipeline_agent.planning import RequestPlan, prepare_request_plan
+from backend.app.agents.ml_pipeline_agent.prompts import build_system_prompt
+from backend.app.agents.ml_pipeline_agent.tools import (
     ToolValidationError,
     UnknownToolError,
     get_tool_schemas,

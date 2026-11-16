@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.agent.llm import supports_native_tool_calling, verify_connection
-from app.agent.tools import get_tool_schemas
+from backend.app.agents.ml_pipeline_agent.llm import supports_native_tool_calling
+from backend.app.agents.ml_pipeline_agent.tools import get_tool_schemas
 from app.config import settings
 from app.schemas.agent import AgentConfig, ToolInfo
 

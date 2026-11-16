@@ -28,7 +28,7 @@ from app.core.model_selector import (
     is_categorical_target_schema,
     validate_target_column,
 )
-from app.agent.tools import ToolValidationError, validate_tool_arguments
+from backend.app.agents.ml_pipeline_agent.tools import ToolValidationError, validate_tool_arguments
 from app.agents.report_agent.service import generate_report_safely
 from app.db.crud import (
     create_artifact, create_operation, get_run, get_session, list_artifacts, list_operations,

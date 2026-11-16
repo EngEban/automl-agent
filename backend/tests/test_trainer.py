@@ -12,7 +12,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 
-from app.agent import executor
+from backend.app.agents.ml_pipeline_agent import executor
 from app.core import trainer
 from app.core import code_generator
 from app.core.memory import DenseConversionLimitError

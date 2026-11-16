@@ -13,12 +13,12 @@ from pydantic import ValidationError
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-from app.agent import agent as agent_module
-from app.agent import executor
-from app.agent import llm as llm_module
-from app.agent import memory
-from app.agent.planning import prepare_request_plan
-from app.agent.tools import (
+from backend.app.agents.ml_pipeline_agent import agent as agent_module
+from backend.app.agents.ml_pipeline_agent import executor
+from backend.app.agents.ml_pipeline_agent import llm as llm_module
+from backend.app.agents.ml_pipeline_agent import memory
+from backend.app.agents.ml_pipeline_agent.planning import prepare_request_plan
+from backend.app.agents.ml_pipeline_agent.tools import (
     TOOL_SCHEMAS,
     ToolValidationError,
     UnknownToolError,

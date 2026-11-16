@@ -26,7 +26,6 @@ from sklearn.model_selection import (
     KFold, StratifiedKFold, train_test_split,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
 
 from app.config import settings

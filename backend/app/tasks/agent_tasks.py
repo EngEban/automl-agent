@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.agent.agent import run_agent
+from backend.app.agents.ml_pipeline_agent.agent import run_agent
 from app.core.run_lifecycle import TERMINAL_RUN_STATUSES
 from app.db.crud import get_run, get_session
 from app.db.session import SessionLocal
 from app.services.run_service import claim_run, emit_event
-from app.worker import celery_app
+from backend.app.worker.worker import celery_app
 
 logger = logging.getLogger(__name__)
 

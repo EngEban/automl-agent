@@ -125,8 +125,6 @@ Ensure-File "backend\app\schemas\common.py"
 # Services
 Ensure-File "backend\app\services\__init__.py"
 Ensure-File "backend\app\services\session_service.py"
-Ensure-File "backend\app\services\analysis_service.py"
-Ensure-File "backend\app\services\pipeline_service.py"
 
 # Tasks
 Ensure-File "backend\app\tasks\__init__.py"
@@ -134,9 +132,7 @@ Ensure-File "backend\app\tasks\agent_tasks.py"
 
 # Utils
 Ensure-File "backend\app\utils\__init__.py"
-Ensure-File "backend\app\utils\files.py"
 Ensure-File "backend\app\utils\logging.py"
-Ensure-File "backend\app\utils\validators.py"
 
 # Tests
 Ensure-File "backend\tests\__init__.py"
@@ -150,8 +146,6 @@ Ensure-File "backend\tests\test_api.py"
 
 # Root files
 Ensure-File "LICENSE"
-Ensure-File "pyproject.toml"
-Ensure-File "Makefile"
 
 # Docs
 Ensure-File "docs\ARCHITECTURE.md"

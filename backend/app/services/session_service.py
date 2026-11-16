@@ -12,7 +12,6 @@ from urllib.parse import unquote, urlsplit
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from sqlalchemy.orm import Session as DBSession
 
 from app.config import settings
@@ -164,7 +163,6 @@ def create_session_from_kaggle(
         
         # Save provenance
         from app.db.models import DatasetSource
-        from datetime import datetime
         ds = DatasetSource(
             session_id=session_id,
             provider=provenance["provider"],

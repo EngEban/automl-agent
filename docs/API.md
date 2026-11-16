@@ -1,28 +1,89 @@
-# AutoML Agent - API Documentation
+# API reference
 
-The AutoML Agent API is built with FastAPI. You can access the interactive Swagger UI at `http://localhost:8100/docs`.
+The FastAPI schema is available at /openapi.json; Swagger UI is at /docs when the backend is running. The application mounts its main router under /api.
 
-## Authentication (`/api/auth`)
-- `POST /register`: Register a new user (sends a verification email).
-- `POST /login`: Authenticate and receive a JWT access token.
-- `POST /google`: Authenticate using a Google OAuth2 authorization code.
-- `GET /me`: Get the current user's profile.
-- `POST /push-subscription`: Save a Web Push subscription for notifications.
+Protected endpoints use Authorization: Bearer <access_token>. Registration, verification, login, Google code exchange, and health endpoints are public. Session, chat, run, artifact, and prediction endpoints are scoped to the authenticated user.
 
-*Note: Most endpoints require the `Authorization: Bearer <token>` header.*
+## Root and health
 
-## Sessions (`/api/sessions`)
-- `POST /upload`: Upload a CSV/Excel/JSON dataset to start a new session.
-- `POST /`: Create a session from a direct URL.
-- `GET /`: List all sessions for the authenticated user.
-- `GET /{session_id}`: Get details of a specific session.
-- `DELETE /{session_id}`: Delete a session and its associated files.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | / | Application name, version, health, and docs path. |
+| GET | /health | Basic process health. |
+| GET | /api/health/ | API health and version. |
+| GET | /api/health/agent/config | Safe Pipeline Agent configuration and supported modes; no API keys. |
+| GET | /api/health/agent/tools | Registered Pipeline Agent tools and argument schemas. |
 
-## Chat (`/api/chat`)
-- `POST /{session_id}`: Send a message to the AI Agent. The agent will execute tools and return a response.
-- `GET /{session_id}/messages`: Retrieve the chat history for a session.
+## Authentication
 
-## Artifacts (`/api/artifacts`)
-- `GET /{session_id}/report`: Download the generated PDF report.
-- `GET /{session_id}/notebook`: Download the reproducible Jupyter Notebook.
-- `GET /{session_id}/dataset`: Download the original dataset.
+| Method | Path | Request and result |
+| --- | --- | --- |
+| POST | /api/auth/register | Email and password; creates an inactive account and attempts to send a verification email. |
+| GET | /api/auth/verify-email?token=... | Verifies the account and redirects to the frontend login URL. |
+| POST | /api/auth/login | Email and password; returns a bearer token and user. The account must be active. |
+| POST | /api/auth/google | Google authorization code and optional redirect URI; returns a bearer token and user. |
+| GET | /api/auth/me | Current authenticated user. |
+| POST | /api/auth/push-subscription | Stores the current user's browser push subscription. |
+
+## Sessions and datasets
+
+| Method | Path | Request and result |
+| --- | --- | --- |
+| POST | /api/sessions | JSON with name, url, and optional target_column and notes; creates a URL-backed session. |
+| POST | /api/sessions/upload | Multipart name, file, and optional target_column and notes; creates an uploaded-data session. |
+| POST | /api/sessions/kaggle | JSON with name, kaggle_ref, and optional target and notes; invokes Kaggle only for this operation. |
+| GET | /api/sessions?limit=50&offset=0 | Lists the current user's sessions. |
+| GET | /api/sessions/{session_id} | Reads one owned session, including dataset metadata. |
+| DELETE | /api/sessions/{session_id} | Deletes an owned session. |
+
+The loader accepts CSV, TSV, JSON, JSON Lines, XLSX, and XLS files. Upload size and row-sampling limits are configured in Settings. Kaggle authentication occurs only when a Kaggle operation is invoked.
+
+## Agent chat and modes
+
+| Method | Path | Request and result |
+| --- | --- | --- |
+| POST | /api/chat/{session_id} | JSON with message, mode (simple or advanced), and optional analysis_options; returns HTTP 202 with run_id, status, and status_url. |
+| GET | /api/chat/{session_id}/messages | Lists persisted messages for an owned session. |
+
+Advanced mode accepts analysis_options.target_column and analysis_options.task_type (classification or regression). Options are rejected in Simple mode. Idempotency-Key is an optional request header for safe retry of a chat submission.
+
+## Run lifecycle and events
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | /api/runs/{run_id} | Reads run status and progress fields. |
+| POST | /api/runs/{run_id}/approve | Approves a pending plan; JSON body contains plan_id. |
+| POST | /api/runs/{run_id}/cancel | Requests cancellation at a safe execution checkpoint; returns HTTP 202. |
+| GET | /api/runs/{run_id}/events | Server-Sent Events stream. Send the last seen event UUID in Last-Event-ID to resume. |
+| GET | /api/runs/{run_id}/events/history?limit=50&cursor=... | Reads a durable event page and returns items, next_cursor, and has_more. |
+
+Events are persisted before delivery. The history limit is 1-200; cursors must identify an event belonging to that run. The stream sends event IDs, event types, and JSON event data.
+
+## Artifacts and prediction
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | /api/artifacts/{session_id} | Lists artifact metadata for an owned session. |
+| GET | /api/artifacts/{session_id}/report | Downloads the latest PDF report. |
+| GET | /api/artifacts/{session_id}/notebook | Downloads the generated Jupyter notebook. |
+| GET | /api/artifacts/{session_id}/dataset | Downloads the original uploaded dataset when available. |
+| GET | /api/artifacts/{session_id}/cleaned-dataset | Downloads the latest cleaned-data CSV. |
+| GET | /api/predict/models/{session_id} | Lists registered model versions for an owned session. |
+| POST | /api/predict/{model_version_id} | JSON body { "records": [{ ... }] }; returns original-label predictions and optional probabilities. |
+
+Reports are generated by the Pipeline Agent's report tool as part of an analysis workflow; there is no separate report-creation endpoint.
+
+## Legacy Celery analysis routes
+
+The older task-ID flow remains registered for compatibility:
+
+- POST /api/analysis/analyze/upload accepts multipart file and optional target_column.
+- POST /api/analysis/analyze/url accepts a URL and optional target.
+- GET /api/analysis/status/{task_id} polls the Celery task.
+- GET /api/analysis/download/report/{task_id} and /api/analysis/download/model/{task_id} download task artifacts.
+
+These routes are separate from the session/run API and currently do not declare the CurrentUser dependency. New frontend work should use the authenticated session and run lifecycle instead of relying on this legacy flow.
+
+## Contract source
+
+The live OpenAPI schema is authoritative for field constraints and response models. This document summarizes the backend contracts; it does not add routes or change authentication behavior.

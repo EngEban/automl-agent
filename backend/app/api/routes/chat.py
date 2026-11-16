@@ -6,7 +6,6 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.db import crud
-from app.db.models import AnalysisRun
 from app.schemas.chat import ChatRequest, MessageRead
 from app.services.run_service import emit_event
 from app.tasks.agent_tasks import run_agent_task

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 440" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Connected data and model nodes</title>
+  <desc id="desc">An original diagram linking a dataset, analysis steps, and a trained model.</desc>
+  <rect x="54" y="44" width="452" height="352" rx="34" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <path d="M154 151 277 112l126 73-32 127-131 27-98-78 12-110Z" stroke="#CBD5E1" stroke-width="2" stroke-dasharray="6 8"/>
+  <path d="m154 151 94 70m29-109-29 109m155-36-155 36m123 91-123-91m-8 154 8-154m-106 76 106-76" stroke="#93C5FD" stroke-width="2.5"/>
+  <rect x="95" y="102" width="118" height="96" rx="18" fill="#fff" stroke="#DCE5F1" stroke-width="2"/>
+  <rect x="111" y="119" width="28" height="28" rx="8" fill="#EFF6FF"/>
+  <path d="M117 137v-5m7 5v-10m7 10v-7" stroke="#3B82F6" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M111 162h85M111 174h54" stroke="#CBD5E1" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="277" cy="112" r="31" fill="#F5F3FF" stroke="#DDD6FE" stroke-width="2"/>
+  <path d="m277 94 16 9v18l-16 9-16-9v-18l16-9Z" stroke="#8B5CF6" stroke-width="2.5" stroke-linejoin="round"/>
+  <circle cx="277" cy="112" r="5" fill="#8B5CF6"/>
+  <rect x="355" y="141" width="112" height="84" rx="18" fill="#fff" stroke="#DCE5F1" stroke-width="2"/>
+  <path d="M376 166h69m-69 13h49m-49 13h59" stroke="#C4B5FD" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="402" cy="312" r="37" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+  <path d="M388 320v-14l14-8 14 8v14m-21 0v-9h14v9" stroke="#3B82F6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="100" y="276" width="98" height="76" rx="17" fill="#fff" stroke="#DCE5F1" stroke-width="2"/>
+  <path d="M121 301h57m-57 13h42m-42 13h50" stroke="#CBD5E1" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="154" cy="151" r="7" fill="#3B82F6" stroke="#fff" stroke-width="4"/>
+  <circle cx="277" cy="221" r="7" fill="#8B5CF6" stroke="#fff" stroke-width="4"/>
+  <circle cx="400" cy="185" r="7" fill="#3B82F6" stroke="#fff" stroke-width="4"/>
+  <circle cx="392" cy="312" r="7" fill="#8B5CF6" stroke="#fff" stroke-width="4"/>
+  <circle cx="171" cy="274" r="7" fill="#3B82F6" stroke="#fff" stroke-width="4"/>
+  <circle cx="277" cy="112" r="4" fill="#fff"/>
+</svg>

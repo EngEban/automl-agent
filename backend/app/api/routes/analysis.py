@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from app.config import settings
 from app.schemas import AnalyzeURLRequest, TaskResponse, TaskStatus
 from app.tasks.analyze import analyze_dataset
-from app.worker import celery_app
+from backend.app.worker.worker import celery_app
 
 router = APIRouter()
 
