@@ -8,7 +8,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session as DBSession
 
-from app.config import settings
+from app.config.settings import settings
 from app.db.crud import get_user_by_email, create_user
 from app.db.models import User
 

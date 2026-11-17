@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from backend.app.agents.ml_pipeline_agent.agent import run_agent
+from app.agents.pipeline_agent.agent import run_agent
 from app.core.run_lifecycle import TERMINAL_RUN_STATUSES
 from app.db.crud import get_run, get_session
 from app.db.session import SessionLocal
 from app.services.run_service import claim_run, emit_event
-from backend.app.worker.worker import celery_app
+from app.services.provider_runtime import ProviderRuntimeError, resolve_assigned_provider
+from app.worker.worker import celery_app
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,13 @@ def run_agent_task(
                 mode=mode,
                 analysis_options=analysis_options,
                 user_id=str(run.requested_by),
+                provider=resolve_assigned_provider(
+                    db,
+                    session_id=session_id,
+                    expected_user_id=str(run.requested_by),
+                    agent_role="pipeline_agent",
+                    run_id=run_id,
+                ),
             )
         )
         current_run = get_run(db, run_id)
@@ -127,10 +135,15 @@ def run_agent_task(
             "tool_results": result.get("tool_results", []),
         }
     except Exception as exc:
-        logger.exception("Agent task failed (run_id=%s error_type=%s)", run_id, type(exc).__name__)
+        if isinstance(exc, ProviderRuntimeError):
+            logger.warning(
+                "Agent provider resolution failed (run_id=%s code=%s)", run_id, exc.code,
+            )
+        else:
+            logger.exception("Agent task failed (run_id=%s error_type=%s)", run_id, type(exc).__name__)
         run = get_run(db, run_id)
         if run is not None and run.status not in TERMINAL_RUN_STATUSES:
-            message = (
+            message = str(exc) if isinstance(exc, ProviderRuntimeError) else (
                 "The run or session is not available to the authenticated owner."
                 if isinstance(exc, PermissionError)
                 else "The Agent task failed. Check server logs for details."
@@ -143,7 +156,12 @@ def run_agent_task(
                     step="error",
                     progress=int(run.progress_percent or 0),
                     message=message,
-                    payload={"error_code": "agent_task_failed"},
+                    payload={
+                        "error_code": (
+                            exc.code if isinstance(exc, ProviderRuntimeError)
+                            else "agent_task_failed"
+                        ),
+                    },
                 )
             except Exception:
                 logger.exception("Could not persist Agent task failure (run_id=%s)", run_id)

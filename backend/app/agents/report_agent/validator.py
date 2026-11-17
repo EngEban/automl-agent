@@ -35,6 +35,11 @@ _KNOWN_MODEL_NAMES = {
     "kneighborsclassifier", "svc", "svm", "linearregression", "ridge",
     "lasso", "xgboost", "lightgbm", "catboost", "gaussiannb",
 }
+_FEATURE_SELECTION_CLAIM = re.compile(
+    r"\b(feature[ -]selection|selected features?|feature selector|"
+    r"mutual information|univariate test|variance filter|correlation filter|extra trees)\b",
+    re.IGNORECASE,
+)
 
 
 def _model_dump(value: Any) -> dict[str, Any]:
@@ -164,6 +169,14 @@ def validate_document(
         elif any(ref not in allowed_refs for ref in section.evidence_refs):
             errors.append(f"Section '{section.key}' references an unavailable fact.")
     body = "\n".join(body_parts)
+
+    for section in document.sections:
+        authored = "\n".join([*section.paragraphs, *section.bullets])
+        if _FEATURE_SELECTION_CLAIM.search(authored):
+            errors.append(
+                "Feature-selection claims must be rendered from validated backend metadata, not authored by the report model."
+            )
+            break
 
     if re.search(r"\d", body):
         errors.append(

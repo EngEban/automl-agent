@@ -12,7 +12,7 @@ from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
-from app.config import settings
+from app.config.settings import settings
 from app.core.preprocessing import IntelligentPreprocessor, prepare_xy_with_target_encoder
 from app.services import inference_service
 

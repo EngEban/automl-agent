@@ -335,6 +335,75 @@ function EvaluationSection({ taskType, evaluation }: { taskType: string | null; 
   );
 }
 
+function FeatureSelectionSection({ metrics }: { metrics: Record<string, unknown> }) {
+  const selection = recordOf(metrics.feature_selection);
+  const enabled = selection.enabled === true;
+  const selected = Array.isArray(selection.selected_features)
+    ? selection.selected_features.filter((item): item is Record<string, unknown> => isRecord(item))
+    : [];
+  const excluded = Array.isArray(selection.excluded_features)
+    ? selection.excluded_features.filter((item): item is Record<string, unknown> => isRecord(item))
+    : [];
+  const folds = Array.isArray(selection.cross_validation_folds)
+    ? selection.cross_validation_folds.filter((item): item is Record<string, unknown> => isRecord(item))
+    : [];
+  const configuration = recordOf(selection.configuration);
+  const foldSets = folds.map((fold) => typeof fold.selected_feature_signature === "string"
+    ? fold.selected_feature_signature
+    : Array.isArray(fold.selected_feature_names)
+      ? fold.selected_feature_names.filter((name): name is string => typeof name === "string").sort().join("\u0000")
+      : "");
+  const foldVariability = new Set(foldSets).size > 1;
+
+  return (
+    <Card className="results-section-card">
+      <div className="results-section-heading"><div><span className="section-overline">TRAINING FEATURE SELECTION</span><h2>Selected features</h2></div></div>
+      {!enabled ? (
+        <p className="results-unavailable-copy">{selection.enabled === false ? "Feature selection was disabled for this run." : "No feature-selection result was recorded for this model version."}</p>
+      ) : (
+        <>
+          <p className="results-selection-summary">
+            <strong>{typeof selection.method === "string" ? selection.method.replaceAll("_", " ") : "Configured method"}</strong>
+            {typeof selection.original_source_features === "number" && ` · ${selection.original_source_features} original source features`}
+            {typeof selection.input_features === "number" && ` · ${selection.input_features} transformed inputs`}
+            {typeof selection.retained_features === "number" && ` · ${selection.retained_features} retained`}
+            {typeof selection.fit_rows === "number" && ` · fitted on ${selection.fit_rows.toLocaleString()} training rows`}
+          </p>
+          <p className="results-selection-note">Selector scores and retained features describe training-only fitting. Holdout metrics are evaluated separately; permutation importance is a separate post-training analysis.</p>
+          <p className="results-selection-note">Scores are specific to the selected method and should not be compared across different selector methods.</p>
+          {Object.keys(configuration).length > 0 && (
+            <dl className="results-selection-config">{Object.entries(configuration).filter(([, value]) => value !== null).map(([key, value]) => (
+              <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{typeof value === "number" || typeof value === "string" ? String(value) : "Recorded"}</dd></div>
+            ))}</dl>
+          )}
+          {folds.length > 0 && <p className="results-selection-note">Cross-validation recorded {folds.length} fold-specific selector fit{folds.length === 1 ? "" : "s"}{foldVariability ? "; retained feature sets differed between folds." : "; retained feature sets were consistent across folds."}</p>}
+          {selected.length > 0 ? (
+            <div className="results-table-scroll"><table className="results-table">
+              <thead><tr><th scope="col">Transformed feature</th><th scope="col">Source feature</th><th scope="col">Training selector score</th><th scope="col">Rank</th></tr></thead>
+              <tbody>{selected.map((item, index) => <tr key={`${String(item.name ?? "feature")}-${index}`}>
+                <th scope="row">{typeof item.name === "string" ? item.name : "Unnamed feature"}</th>
+                <td>{typeof item.source_feature === "string" ? item.source_feature : "Unavailable"}</td>
+                <td>{typeof item.score === "number" && Number.isFinite(item.score) ? item.score.toPrecision(5) : "—"}</td>
+                <td>{typeof item.rank === "number" && Number.isSafeInteger(item.rank) ? item.rank : "—"}</td>
+              </tr>)}</tbody>
+            </table></div>
+          ) : <p className="results-unavailable-copy">The selector ran, but selected feature details were not returned.</p>}
+          {typeof selection.selected_feature_names_truncated === "number" && selection.selected_feature_names_truncated > 0 && (
+            <p className="results-selection-note">Showing the first 300 selected transformed features; {selection.selected_feature_names_truncated.toLocaleString()} more names were omitted from the metadata for size.</p>
+          )}
+          {excluded.length > 0 && (
+            <details className="results-selection-excluded">
+              <summary>Excluded features ({excluded.length + (typeof selection.excluded_features_truncated === "number" ? selection.excluded_features_truncated : 0)})</summary>
+              <ul>{excluded.slice(0, 30).map((item, index) => <li key={`${String(item.name ?? "feature")}-${index}`}><strong>{typeof item.name === "string" ? item.name : "Unnamed feature"}</strong><span>{typeof item.reason === "string" ? item.reason : "Excluded by fitted preprocessing or selector."}</span></li>)}</ul>
+              {(excluded.length > 30 || (typeof selection.excluded_features_truncated === "number" && selection.excluded_features_truncated > 0)) && <p className="results-unavailable-copy">Showing up to 30 exclusions from the recorded details.</p>}
+            </details>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
 export function ResultsPage({
   initialSessionId,
   initialRunId,
@@ -872,8 +941,10 @@ export function ResultsPage({
 
                 <Card className="results-section-card">
                   <div className="results-section-heading"><div><span className="section-overline">FEATURE INSIGHTS</span><h2>Feature importance</h2></div></div>
-                  <p className="results-unavailable-copy">Structured feature-importance values are not included in the model registry response, so no feature ranking is shown.</p>
+                  <p className="results-unavailable-copy">Permutation importance is a separate post-training holdout analysis. Structured permutation-importance values are not included in the model registry response.</p>
                 </Card>
+
+                <FeatureSelectionSection metrics={modelMetrics} />
 
                 <Card className="results-section-card">
                   <div className="results-section-heading"><div><span className="section-overline">ANALYSIS FILES</span><h2>Available artifacts</h2></div></div>

@@ -54,7 +54,7 @@ Write-Host "== Step 2: Directory tree ==" -ForegroundColor Yellow
 
 $dirs = @(
     "backend\app\api\routes",
-    "backend\app\agent",
+    "backend\app\agents\pipeline_agent",
     "backend\app\db",
     "backend\app\services",
     "backend\app\utils",
@@ -96,13 +96,13 @@ Ensure-File "backend\app\api\routes\artifacts.py"
 Ensure-File "backend\app\api\routes\health.py"
 
 # Agent
-Ensure-File "backend\app\agent\__init__.py"
-Ensure-File "backend\app\agent\llm.py"
-Ensure-File "backend\app\agent\prompts.py"
-Ensure-File "backend\app\agent\tools.py"
-Ensure-File "backend\app\agent\agent.py"
-Ensure-File "backend\app\agent\memory.py"
-Ensure-File "backend\app\agent\executor.py"
+Ensure-File "backend\app\agents\pipeline_agent\__init__.py"
+Ensure-File "backend\app\agents\pipeline_agent\llm.py"
+Ensure-File "backend\app\agents\pipeline_agent\prompts.py"
+Ensure-File "backend\app\agents\pipeline_agent\tools.py"
+Ensure-File "backend\app\agents\pipeline_agent\agent.py"
+Ensure-File "backend\app\agents\pipeline_agent\memory.py"
+Ensure-File "backend\app\agents\pipeline_agent\executor.py"
 
 # Core (exists - will not be touched)
 Ensure-File "backend\app\core\__init__.py"

@@ -2,7 +2,7 @@
 
 ## Pipeline Agent
 
-The Pipeline Agent lives in app/agent and uses LiteLLM with the independent LLM_* settings. It is invoked asynchronously through the chat and run APIs: the request creates an AnalysisRun, Celery executes it, and persisted events are available through SSE and event history.
+The Pipeline Agent lives in `app.agents.pipeline_agent` and uses LiteLLM with the independent `LLM_*` settings. Backend imports use the canonical `app.*` namespace. It is invoked asynchronously through the chat and run APIs: the request creates an AnalysisRun, Celery executes it through `app.worker.worker:celery_app`, and persisted events are available through SSE and event history.
 
 Simple mode accepts a user message without analysis options. Advanced mode also accepts a target column and task type. Tool schemas are allowlisted, arguments are validated before execution, and per-run iteration and tool-call limits bound the loop. Approval-required plans are not run until the owner approves them.
 
@@ -19,9 +19,9 @@ Tool failures are returned as structured results. A completed tool result is pre
 
 ## Report Agent
 
-The Report Agent lives in app/agents/report_agent and remains independent from the Pipeline Agent. It builds a compact fact payload from completed results, runs a bounded LangGraph generation and validation workflow, and renders HTML/PDF artifacts. It reads REPORT_LLM_* settings; changing Pipeline Agent settings does not select its provider or model.
+The Report Agent lives in `app.agents.report_agent` and remains independent from the Pipeline Agent. It builds a compact fact payload from completed results, runs a bounded LangGraph generation and validation workflow, and renders HTML/PDF artifacts. It reads `REPORT_LLM_*` settings; changing Pipeline Agent settings does not select its provider or model.
 
-When REPORT_AGENT_ENABLED is false, app/agents/report_agent/service.py retains the legacy app/core/report_generator.py fallback. Keep this fallback and compatible artifact loading paths until downstream consumers have been checked.
+When `REPORT_AGENT_ENABLED` is false, `app.agents.report_agent.service` retains the legacy `app.core.report_generator` fallback. Keep this fallback and compatible artifact loading paths until downstream consumers have been checked.
 
 ## Verification
 

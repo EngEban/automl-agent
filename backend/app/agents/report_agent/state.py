@@ -9,6 +9,8 @@ class ReportAgentState(TypedDict, total=False):
     analysis_id: str
     report_type: str
     language: str
+    provider_id: str
+    model_identifier: str
     input_facts: dict[str, Any]
     facts: dict[str, Any]
     outline: dict[str, Any]

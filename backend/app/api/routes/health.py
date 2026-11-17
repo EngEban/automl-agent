@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from backend.app.agents.ml_pipeline_agent.llm import supports_native_tool_calling
-from backend.app.agents.ml_pipeline_agent.tools import get_tool_schemas
-from app.config import settings
+from app.agents.pipeline_agent.llm import supports_native_tool_calling
+from app.agents.pipeline_agent.tools import get_tool_schemas
+from app.config.settings import settings
 from app.schemas.agent import AgentConfig, ToolInfo
 
 router = APIRouter()

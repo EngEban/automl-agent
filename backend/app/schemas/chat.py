@@ -8,6 +8,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.feature_selection import FeatureSelectionConfig
+
 
 class AnalysisOptions(BaseModel):
     """Training options currently supported by the shared AutoML backend."""
@@ -16,6 +18,7 @@ class AnalysisOptions(BaseModel):
 
     target_column: str | None = Field(default=None, min_length=1)
     task_type: Literal["classification", "regression"] | None = None
+    feature_selection: FeatureSelectionConfig | None = None
 
 
 class ChatRequest(BaseModel):

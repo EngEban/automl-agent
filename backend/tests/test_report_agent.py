@@ -25,12 +25,40 @@ from app.agents.report_agent.schemas import (
     ReportSection,
 )
 from app.agents.report_agent.service import generate_report, generate_report_safely
+from app.agents.report_agent import service as report_service
 from app.agents.report_agent.validator import (
     validate_document,
     validate_facts,
     validate_outline,
 )
-from app.config import settings
+from app.config.settings import settings
+from app.services.provider_registry import CAPABILITIES, resolve_litellm_model
+from app.services.provider_runtime import RuntimeProvider, ProviderRuntimeError
+
+
+def _report_provider(*, provider_id="groq", model_identifier="openai/gpt-oss-20b"):
+    return RuntimeProvider(
+        user_id="report-owner",
+        agent_role="report_agent",
+        provider_id=provider_id,
+        model_identifier=model_identifier,
+        model=resolve_litellm_model(provider_id, model_identifier),
+        endpoint_url=None,
+        configuration={"temperature": 0.2, "max_tokens": 256},
+        capabilities={name: "supported" for name in CAPABILITIES},
+        unknown_required_capabilities=(),
+        credential="unit-test-token",
+    )
+
+
+@pytest.fixture(autouse=True)
+def assigned_report_provider(monkeypatch):
+    runtime = _report_provider()
+    monkeypatch.setattr(
+        report_service,
+        "_resolve_report_provider",
+        lambda **_kwargs: runtime,
+    )
 
 
 def _analysis_inputs() -> dict:
@@ -138,10 +166,8 @@ def _mock_model(monkeypatch, *, invalid_documents: int = 0):
     facts = _facts()
     outline = _outline(facts)
     calls = {"outline": 0, "document": 0}
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-
     def invoke_structured(**kwargs):
+        assert kwargs["provider"].agent_role == "report_agent"
         schema = kwargs["response_schema"]
         if schema is ReportOutline:
             calls["outline"] += 1
@@ -157,9 +183,6 @@ def _mock_model(monkeypatch, *, invalid_documents: int = 0):
 def _invoke_service(tmp_path, monkeypatch, *, invalid_documents: int = 0):
     _mock_model(monkeypatch, invalid_documents=invalid_documents)
     monkeypatch.setattr(settings, "REPORT_AGENT_ENABLED", True)
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "unit-test-token")
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
     monkeypatch.setattr(settings, "REPORT_DIR", tmp_path)
 
     from app.agents.report_agent import graph
@@ -226,6 +249,50 @@ def test_inconsistent_sampling_facts_are_rejected():
 
     assert result.valid is False
     assert any("source rows" in error.lower() for error in result.errors)
+
+
+def test_report_facts_and_html_include_only_recorded_feature_selection(tmp_path, monkeypatch):
+    from app.agents.report_agent.html_renderer import render_html
+    from app.agents.report_agent.graph import _authoring_facts
+
+    monkeypatch.setattr(settings, "REPORT_DIR", tmp_path)
+    args = _analysis_inputs()
+    args["training"]["feature_selection"] = {
+        "enabled": True,
+        "method": "mutual_information",
+        "configuration": {"top_k": 2, "min_features": 1},
+        "fit_rows": 64,
+        "original_source_features": 4,
+        "input_features": 7,
+        "retained_features": 2,
+        "selected_features": [
+            {"name": "num__signal", "source_feature": "signal", "score": 0.24, "rank": 1},
+        ],
+    }
+    facts = _facts(**args)
+    assert facts.feature_selection.enabled is True
+    assert facts.feature_selection.method == "mutual_information"
+    assert facts.feature_selection.selected_features[0].name == "num__signal"
+    assert "feature_selection" not in _authoring_facts(facts)
+
+    document = _document()
+    document.sections.append(ReportSection(
+        key="feature_selection",
+        title="Training feature selection",
+        paragraphs=["The recorded selector details are supplied by the backend."],
+        evidence_refs=["training.feature_selection"],
+    ))
+    path = render_html("report-feature-selection", document, facts)
+    html = path.read_text(encoding="utf-8")
+    assert "mutual_information" in html
+    assert "num__signal" in html
+    assert "training rows only" in html
+    assert "0.24" in html
+
+    args["training"].pop("feature_selection")
+    legacy_facts = _facts(**args)
+    assert legacy_facts.feature_selection.enabled is False
+    assert legacy_facts.feature_selection.available is False
 
 
 def test_invalid_essential_facts_stop_before_model_invocation(tmp_path, monkeypatch):
@@ -432,137 +499,67 @@ def test_pdf_renderer_success_and_unavailable_runtime(tmp_path, monkeypatch):
     assert not (tmp_path / "pdf-unavailable.pdf").exists()
 
 
-def test_report_provider_uses_existing_settings_and_suppresses_secret_errors(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "unit-secret-token")
-    monkeypatch.setattr(report_model, "_litellm_completion", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unit-secret-token")))
+def test_report_model_uses_invocation_provider_and_suppresses_secret_errors(monkeypatch, caplog):
+    runtime = _report_provider(provider_id="openai", model_identifier="gpt-report-a")
+    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "developer-owned-key-must-not-be-used")
+    captured = {}
 
-    with pytest.raises(report_model.ReportProviderError) as error:
-        report_model.invoke_structured(
-            system_prompt="system", user_prompt="user", response_schema=ReportOutline
+    def fail(selected_provider, **kwargs):
+        captured["provider"] = selected_provider
+        captured.update(kwargs)
+        raise ProviderRuntimeError(
+            "The selected provider rejected the saved credential.",
+            code="provider_authentication_failed",
+            status_code=401,
         )
 
-    assert report_model.resolve_report_model() == "groq/openai/gpt-oss-20b"
-    assert "unit-secret-token" not in str(error.value)
-    assert "unit-secret-token" not in caplog.text
+    monkeypatch.setattr(report_model, "_invoke_provider", fail)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(report_model.ReportProviderError) as error:
+            report_model.invoke_structured(
+                system_prompt="system", user_prompt="user",
+                response_schema=ReportOutline, provider=runtime,
+            )
+
+    assert captured["provider"] is runtime
+    assert captured["response_format"]["type"] == "json_schema"
+    assert runtime.model == "openai/gpt-report-a"
+    assert runtime.credential not in caplog.text
+    assert "developer-owned-key-must-not-be-used" not in caplog.text
+    assert runtime.credential not in str(error.value)
+    assert error.value.error_code == "report_provider_authentication_failed"
 
 
-def test_groq_provider_model_prefix_and_pipeline_provider_are_preserved(monkeypatch):
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    assert report_model.resolve_report_model() == "groq/openai/gpt-oss-20b"
-
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "groq/openai/gpt-oss-20b")
-    assert report_model.resolve_report_model() == "groq/openai/gpt-oss-20b"
-
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "groq/groq/openai/gpt-oss-20b")
-    with pytest.raises(report_model.ReportAgentConfigurationError, match="REPORT_LLM_MODEL"):
-        report_model.resolve_report_model()
-
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "xai")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "grok-4.7")
-    with pytest.raises(report_model.ReportAgentConfigurationError, match="REPORT_LLM_PROVIDER"):
-        report_model.resolve_report_model()
-
-    assert settings.LLM_PROVIDER == "ollama"
+def test_report_model_mapping_is_profile_scoped():
+    groq = _report_provider()
+    anthropic = _report_provider(provider_id="anthropic", model_identifier="claude-test")
+    assert report_model.resolve_report_model(groq) == "groq/openai/gpt-oss-20b"
+    assert report_model.resolve_report_model(anthropic) == "anthropic/claude-test"
+    with pytest.raises(report_model.ReportAgentConfigurationError):
+        report_model.resolve_report_model(None)
 
 
-class _FakeProviderError(Exception):
-    def __init__(self, status_code, message, headers=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response = SimpleNamespace(status_code=status_code, headers=headers or {})
+def test_report_provider_runtime_errors_remain_actionable(monkeypatch):
+    runtime = _report_provider()
 
-
-@pytest.mark.parametrize(
-    ("status", "detail", "expected_code", "message_fragment"),
-    [
-        (401, "invalid api key: unit-secret-value", "report_authentication_failed", "HTTP 401"),
-        (402, "insufficient credits: unit-secret-value", "report_quota_exceeded", "quota or credits"),
-        (403, "permission denied: unit-secret-value", "report_model_access_denied", "denied access"),
-        (404, "model not found: unit-secret-value", "report_model_not_found", "could not find"),
-        (408, "request timed out: unit-secret-value", "report_provider_timeout", "timed out"),
-        (429, "rate limit reached: unit-secret-value", "report_rate_limited", "rate limit"),
-        (429, "daily quota exceeded: unit-secret-value", "report_quota_exceeded", "quota or credits"),
-        (500, "internal server error: unit-secret-value", "report_provider_server_error", "HTTP 500"),
-        (400, "unsupported JSON schema: unit-secret-value", "report_structured_request_rejected", "HTTP 400"),
-    ],
-)
-def test_groq_provider_errors_are_classified_without_echoing_secrets(
-    monkeypatch, status, detail, expected_code, message_fragment
-):
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "configured-secret")
-    monkeypatch.setattr(
-        report_model,
-        "_litellm_completion",
-        lambda **_kwargs: (_ for _ in ()).throw(_FakeProviderError(status, detail)),
-    )
-
-    with pytest.raises(report_model.ReportProviderError) as caught:
-        report_model.invoke_structured(
-            system_prompt="system", user_prompt="user", response_schema=ReportOutline
+    def fail(_provider, **_kwargs):
+        raise ProviderRuntimeError(
+            "The selected model does not support JSON schema. Test its capabilities.",
+            code="incompatible_provider_capabilities",
         )
 
-    assert caught.value.error_code == expected_code
-    assert message_fragment.lower() in str(caught.value).lower()
-    assert "unit-secret-value" not in str(caught.value)
-    assert "configured-secret" not in str(caught.value)
-
-
-def test_groq_retry_after_is_reported_without_retrying(monkeypatch):
-    calls = []
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "configured-secret")
-
-    def fail_once(**_kwargs):
-        calls.append(True)
-        raise _FakeProviderError(429, "rate limit", {"Retry-After": "23"})
-
-    monkeypatch.setattr(report_model, "_litellm_completion", fail_once)
-    with pytest.raises(report_model.ReportProviderError) as caught:
+    monkeypatch.setattr(report_model, "_invoke_provider", fail)
+    with pytest.raises(report_model.ReportProviderError, match="Test its capabilities") as caught:
         report_model.invoke_structured(
-            system_prompt="system", user_prompt="user", response_schema=ReportOutline
+            system_prompt="system", user_prompt="user",
+            response_schema=ReportOutline, provider=runtime,
         )
-
-    assert len(calls) == 1
-    assert caught.value.retry_after_seconds == 23
-    assert "Retry after 23 seconds" in str(caught.value)
+    assert caught.value.error_code == "report_incompatible_provider_capabilities"
 
 
-@pytest.mark.parametrize(
-    ("provider_exception", "expected_code"),
-    [
-        (TimeoutError("request timed out"), "report_provider_timeout"),
-        (ConnectionError("network unavailable"), "report_network_error"),
-    ],
-)
-def test_groq_timeout_and_network_failures_are_actionable(
-    monkeypatch, provider_exception, expected_code
-):
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "configured-secret")
-    monkeypatch.setattr(
-        report_model,
-        "_litellm_completion",
-        lambda **_kwargs: (_ for _ in ()).throw(provider_exception),
-    )
-
-    with pytest.raises(report_model.ReportProviderError) as caught:
-        report_model.invoke_structured(
-            system_prompt="system", user_prompt="user", response_schema=ReportOutline
-        )
-
-    assert caught.value.error_code == expected_code
-
-
-def test_groq_strict_schema_closes_objects_and_requires_every_property():
-    schema = report_model._groq_strict_schema(ReportDocument.model_json_schema())
-    allowed = report_model._GROQ_SCHEMA_KEYS | {"required", "additionalProperties"}
+def test_strict_schema_closes_objects_and_requires_every_property():
+    schema = report_model._strict_json_schema(ReportDocument.model_json_schema())
+    allowed = report_model._STRICT_SCHEMA_KEYS | {"required", "additionalProperties"}
 
     def walk(node):
         if isinstance(node, dict):
@@ -595,25 +592,22 @@ def test_groq_strict_schema_closes_objects_and_requires_every_property():
         ([SimpleNamespace(message=SimpleNamespace(content="{}"))], "report_schema_validation_failed"),
     ],
 )
-def test_groq_incomplete_or_invalid_structured_responses_fail_safely(
+def test_incomplete_or_invalid_structured_responses_fail_safely(
     monkeypatch, choices, expected_code
 ):
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "configured-secret")
     monkeypatch.setattr(
         report_model,
-        "_litellm_completion",
-        lambda **_kwargs: SimpleNamespace(choices=choices),
+        "_invoke_provider",
+        lambda _provider, **_kwargs: SimpleNamespace(choices=choices),
     )
 
     with pytest.raises(report_model.ReportProviderError) as caught:
         report_model.invoke_structured(
-            system_prompt="system", user_prompt="user", response_schema=ReportOutline
+            system_prompt="system", user_prompt="user", response_schema=ReportOutline,
+            provider=_report_provider(),
         )
 
     assert caught.value.error_code == expected_code
-    assert "configured-secret" not in str(caught.value)
 
 
 def test_missing_report_key_is_lazy_and_application_import_still_succeeds(tmp_path, monkeypatch):
@@ -637,7 +631,7 @@ def test_missing_report_key_is_lazy_and_application_import_still_succeeds(tmp_pa
         [
             sys.executable,
             "-c",
-            "from app.config import settings; assert not settings.REPORT_LLM_API_KEY; "
+            "from app.config.settings import settings; assert not settings.REPORT_LLM_API_KEY; "
             "from app.main import app; assert app.title == 'AutoML Agent API'",
         ],
         cwd=Path(__file__).resolve().parents[1],
@@ -648,6 +642,14 @@ def test_missing_report_key_is_lazy_and_application_import_still_succeeds(tmp_pa
         check=False,
     )
     assert imported.returncode == 0, imported.stderr
+    monkeypatch.setattr(
+        report_service,
+        "_resolve_report_provider",
+        lambda **_kwargs: (_ for _ in ()).throw(ProviderRuntimeError(
+            "Configure and test a provider for the Report Agent in AI Provider Settings.",
+            code="provider_assignment_required",
+        )),
+    )
     args = _analysis_inputs()
 
     result = generate_report(
@@ -655,10 +657,11 @@ def test_missing_report_key_is_lazy_and_application_import_still_succeeds(tmp_pa
     )
 
     assert result["status"] == "failed"
-    assert result["error_code"] == "report_configuration_missing"
-    assert "REPORT_LLM_API_KEY" in result["message"]
+    assert result["error_code"] == "report_provider_assignment_required"
+    assert "AI Provider Settings" in result["message"]
+    assert "REPORT_LLM_API_KEY" not in result["message"]
 
-def test_litellm_sends_groq_strict_schema_and_pydantic_validates_response(monkeypatch):
+def test_selected_provider_receives_strict_schema_and_pydantic_validates_response(monkeypatch):
     response = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
             "title": "Test outline",
@@ -671,17 +674,17 @@ def test_litellm_sends_groq_strict_schema_and_pydantic_validates_response(monkey
     )
     captured = {}
 
-    def fake_completion(**kwargs):
+    def fake_completion(provider, **kwargs):
+        captured["provider"] = provider
         captured.update(kwargs)
         return response
 
-    monkeypatch.setattr(settings, "REPORT_LLM_API_KEY", "test-token")
-    monkeypatch.setattr(settings, "REPORT_LLM_PROVIDER", "groq")
-    monkeypatch.setattr(settings, "REPORT_LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setattr(report_model, "_litellm_completion", fake_completion)
+    runtime = _report_provider(provider_id="openai", model_identifier="gpt-report")
+    monkeypatch.setattr(report_model, "_invoke_provider", fake_completion)
 
     outline = report_model.invoke_structured(
-        system_prompt="system", user_prompt="user", response_schema=ReportOutline
+        system_prompt="system", user_prompt="user", response_schema=ReportOutline,
+        provider=runtime,
     )
 
     assert isinstance(outline, ReportOutline)
@@ -689,11 +692,9 @@ def test_litellm_sends_groq_strict_schema_and_pydantic_validates_response(monkey
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True
     assert response_format["json_schema"]["schema"]["type"] == "object"
-    assert captured["model"] == "groq/openai/gpt-oss-20b"
-    assert captured["timeout"] == settings.REPORT_LLM_TIMEOUT_SECONDS
-    assert captured["stream"] is False
-    assert captured["num_retries"] == 0
-    assert captured["api_key"] == "test-token"
+    assert captured["provider"] is runtime
+    assert "api_key" not in captured
+    assert "model" not in captured
     assert "tools" not in captured
 
 

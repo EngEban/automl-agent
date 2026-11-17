@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,8 @@ from app.agents.report_agent.schemas import (
     ReportOutline,
 )
 from app.agents.report_agent.validator import validate_document, validate_facts, validate_outline
-from app.config import settings
+from app.config.settings import settings
+from app.services.provider_runtime import RuntimeProvider
 
 logger = logging.getLogger(__name__)
 MAX_REPORT_REVISIONS = 2
@@ -29,6 +31,13 @@ MAX_REPORT_REVISIONS = 2
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _authoring_facts(facts: ReportFacts) -> dict[str, Any]:
+    """Keep fitted-selector details for deterministic rendering, not LLM prose."""
+    payload = facts.model_dump(mode="json")
+    payload.pop("feature_selection", None)
+    return payload
 
 
 def build_report_context(state: ReportAgentState) -> dict[str, Any]:
@@ -81,7 +90,9 @@ def route_after_fact_validation(state: ReportAgentState) -> str:
     return "plan_report" if state.get("status") == "planning" else "save_report"
 
 
-def plan_report(state: ReportAgentState) -> dict[str, Any]:
+def plan_report(
+    state: ReportAgentState, *, provider: RuntimeProvider | None = None,
+) -> dict[str, Any]:
     facts = ReportFacts.model_validate(state["facts"])
     catalog = REPORT_SECTIONS[facts.report_type]
     prompt = PLAN_USER.format(
@@ -89,13 +100,14 @@ def plan_report(state: ReportAgentState) -> dict[str, Any]:
         language=facts.language,
         task_type=facts.task_type,
         section_catalog=_json(catalog),
-        facts_json=_json(facts.model_dump(mode="json")),
+        facts_json=_json(_authoring_facts(facts)),
     )
     try:
         outline = report_model.invoke_structured(
             system_prompt=REPORT_SYSTEM,
             user_prompt=prompt,
             response_schema=ReportOutline,
+            provider=provider,
         )
         checked = validate_outline(outline, facts)
         if not checked.valid:
@@ -127,7 +139,12 @@ def route_after_planning(state: ReportAgentState) -> str:
     return "write_report" if state.get("status") == "writing" else "save_report"
 
 
-def _write_document(state: ReportAgentState, *, revision: bool = False) -> dict[str, Any]:
+def _write_document(
+    state: ReportAgentState,
+    *,
+    revision: bool = False,
+    provider: RuntimeProvider | None = None,
+) -> dict[str, Any]:
     facts = ReportFacts.model_validate(state["facts"])
     outline = ReportOutline.model_validate(state["outline"])
     if revision:
@@ -135,25 +152,28 @@ def _write_document(state: ReportAgentState, *, revision: bool = False) -> dict[
             errors_json=_json(state.get("validation_errors", [])),
             document_json=_json(state.get("document", {})),
             outline_json=_json(outline.model_dump(mode="json")),
-            facts_json=_json(facts.model_dump(mode="json")),
+            facts_json=_json(_authoring_facts(facts)),
         )
     else:
         prompt = WRITE_USER.format(
             language=facts.language,
             outline_json=_json(outline.model_dump(mode="json")),
-            facts_json=_json(facts.model_dump(mode="json")),
+            facts_json=_json(_authoring_facts(facts)),
         )
     document = report_model.invoke_structured(
         system_prompt=REPORT_SYSTEM,
         user_prompt=prompt,
         response_schema=ReportDocument,
+        provider=provider,
     )
     return {"document": document.model_dump(mode="json"), "status": "validating_report"}
 
 
-def write_report(state: ReportAgentState) -> dict[str, Any]:
+def write_report(
+    state: ReportAgentState, *, provider: RuntimeProvider | None = None,
+) -> dict[str, Any]:
     try:
-        return _write_document(state)
+        return _write_document(state, provider=provider)
     except report_model.ReportAgentConfigurationError as exc:
         return {
             "status": "failed",
@@ -193,10 +213,12 @@ def report_validation_exhausted(state: ReportAgentState) -> dict[str, Any]:
     }
 
 
-def revise_report(state: ReportAgentState) -> dict[str, Any]:
+def revise_report(
+    state: ReportAgentState, *, provider: RuntimeProvider | None = None,
+) -> dict[str, Any]:
     next_count = int(state.get("revision_count", 0)) + 1
     try:
-        update = _write_document(state, revision=True)
+        update = _write_document(state, revision=True, provider=provider)
         update["revision_count"] = next_count
         return update
     except report_model.ReportAgentConfigurationError as exc:
@@ -264,17 +286,13 @@ def render_report_pdf(state: ReportAgentState) -> dict[str, Any]:
 def save_report(state: ReportAgentState) -> dict[str, Any]:
     report_id = state.get("report_id", "")
     metadata_path = settings.REPORT_DIR / f"{report_id}.report.json"
-    try:
-        model = report_model.resolve_report_model()
-    except report_model.ReportAgentConfigurationError:
-        model = None
     metadata = {
         "report_id": report_id,
         "analysis_id": state.get("analysis_id"),
         "report_type": state.get("report_type"),
         "language": state.get("language"),
-        "provider": settings.REPORT_LLM_PROVIDER,
-        "model": model,
+        "provider": state.get("provider_id") or "unconfigured",
+        "model": state.get("model_identifier"),
         "generation_status": state.get("status", "failed"),
         "validation_status": state.get("validation_status", "not_run"),
         "revision_count": int(state.get("revision_count", 0)),
@@ -295,15 +313,15 @@ def save_report(state: ReportAgentState) -> dict[str, Any]:
         return {"metadata_path": "", "metadata_save_error": True}
 
 
-def build_report_graph():
+def build_report_graph(provider: RuntimeProvider | None = None):
     """Construct and compile the finite report workflow."""
     builder = StateGraph(ReportAgentState)
     builder.add_node("build_report_context", build_report_context)
     builder.add_node("validate_report_facts", validate_report_facts)
-    builder.add_node("plan_report", plan_report)
-    builder.add_node("write_report", write_report)
+    builder.add_node("plan_report", partial(plan_report, provider=provider))
+    builder.add_node("write_report", partial(write_report, provider=provider))
     builder.add_node("validate_report", validate_report)
-    builder.add_node("revise_report", revise_report)
+    builder.add_node("revise_report", partial(revise_report, provider=provider))
     builder.add_node("report_validation_exhausted", report_validation_exhausted)
     builder.add_node("render_html", render_report_html)
     builder.add_node("render_pdf", render_report_pdf)

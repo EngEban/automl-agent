@@ -19,7 +19,7 @@ import {
 import { AppShell } from "@/components/layout/app-shell";
 import { Alert } from "@/components/ui/feedback";
 import { Button } from "@/components/ui/button";
-import { SelectField } from "@/components/ui/form-controls";
+import { SelectField, TextInput, Toggle } from "@/components/ui/form-controls";
 import { Badge, Card } from "@/components/ui/surfaces";
 import { ProtectedRoute } from "@/features/auth/protected-route";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -38,6 +38,7 @@ import { ApiError, ApiTimeoutError } from "@/lib/api/client";
 import type {
   AgentMessageRead,
   AnalysisOptions,
+  FeatureSelectionConfig,
   SessionDetails,
   SessionListItem,
 } from "@/types/api";
@@ -138,6 +139,12 @@ function AgentWorkspacePageContent() {
   const [mode, setMode] = useState<"simple" | "advanced">("simple");
   const [targetColumn, setTargetColumn] = useState("");
   const [taskType, setTaskType] = useState<"" | "classification" | "regression">("");
+  const [featureSelectionEnabled, setFeatureSelectionEnabled] = useState(false);
+  const [featureSelectionMethod, setFeatureSelectionMethod] = useState<FeatureSelectionConfig["method"]>("mutual_information");
+  const [featureSelectionTopK, setFeatureSelectionTopK] = useState("20");
+  const [featureSelectionMinimum, setFeatureSelectionMinimum] = useState("1");
+  const [featureSelectionThreshold, setFeatureSelectionThreshold] = useState("0.95");
+  const [featureSelectionTrees, setFeatureSelectionTrees] = useState("50");
   const [draft, setDraft] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [requestError, setRequestError] = useState("");
@@ -380,6 +387,38 @@ function AgentWorkspacePageContent() {
     if (mode === "advanced") {
       if (targetColumn) selectedOptions.target_column = targetColumn;
       if (taskType) selectedOptions.task_type = taskType;
+      if (featureSelectionEnabled) {
+        const minimum = Number(featureSelectionMinimum);
+        const topK = Number(featureSelectionTopK);
+        const threshold = Number(featureSelectionThreshold);
+        const trees = Number(featureSelectionTrees);
+        const hasTopK = featureSelectionMethod !== "variance_filter";
+        const thresholdValid = featureSelectionMethod === "variance_filter"
+          ? Number.isFinite(threshold) && threshold >= 0 && threshold <= 1_000_000_000_000
+          : featureSelectionMethod === "correlation_filter"
+            ? Number.isFinite(threshold) && threshold >= 0 && threshold <= 1
+            : true;
+        if (!Number.isInteger(minimum) || minimum < 1 || minimum > 300
+          || (hasTopK && (!Number.isInteger(topK) || topK < 1 || topK > 300 || minimum > topK))
+          || !thresholdValid
+          || (featureSelectionMethod === "extra_trees" && (!Number.isInteger(trees) || trees < 10 || trees > 200))) {
+          setRequestError("Review the feature-selection values: use whole feature counts from 1 to 300, keep the minimum at or below the maximum, and use a valid method threshold.");
+          return;
+        }
+        selectedOptions.feature_selection = {
+          method: featureSelectionMethod,
+          min_features: minimum,
+          ...(featureSelectionMethod === "variance_filter" || featureSelectionMethod === "correlation_filter"
+            ? { threshold }
+            : {}),
+          ...(featureSelectionMethod !== "variance_filter"
+            ? { top_k: topK }
+            : {}),
+          ...(featureSelectionMethod === "extra_trees"
+            ? { n_estimators: trees }
+            : {}),
+        };
+      }
     }
 
     sendLock.current = true;
@@ -547,6 +586,93 @@ function AgentWorkspacePageContent() {
                     ]}
                     onChange={(event) => setTaskType(event.currentTarget.value as "" | "classification" | "regression")}
                   />
+                  <div className="agent-feature-selection-settings">
+                    <Toggle
+                      label="Use feature selection"
+                      description="Off by default; the selected method is learned again inside every training fold."
+                      checked={featureSelectionEnabled}
+                      onCheckedChange={setFeatureSelectionEnabled}
+                      disabled={!session || isSubmitting}
+                    />
+                    {featureSelectionEnabled && (
+                      <>
+                        <SelectField
+                          label="Training selector"
+                          hint="Applied to preprocessed numeric and one-hot encoded features."
+                          value={featureSelectionMethod}
+                          disabled={!session || isSubmitting}
+                          options={[
+                            { label: "Mutual information", value: "mutual_information" },
+                            { label: "ANOVA / F-regression", value: "univariate_test" },
+                            { label: "Correlation filter", value: "correlation_filter" },
+                            { label: "Variance filter", value: "variance_filter" },
+                            { label: "Extra Trees importance", value: "extra_trees" },
+                          ]}
+                          onChange={(event) => {
+                            const method = event.currentTarget.value as FeatureSelectionConfig["method"];
+                            setFeatureSelectionMethod(method);
+                            if (method === "variance_filter") setFeatureSelectionThreshold("0");
+                            if (method === "correlation_filter") setFeatureSelectionThreshold("0.95");
+                          }}
+                        />
+                        {(featureSelectionMethod === "mutual_information" || featureSelectionMethod === "univariate_test" || featureSelectionMethod === "extra_trees" || featureSelectionMethod === "correlation_filter") && (
+                          <TextInput
+                            label="Maximum retained features"
+                            type="number"
+                            min={1}
+                            max={300}
+                            step={1}
+                            value={featureSelectionTopK}
+                            disabled={!session || isSubmitting}
+                            onChange={(event) => setFeatureSelectionTopK(event.currentTarget.value)}
+                          />
+                        )}
+                        <TextInput
+                          label="Minimum retained features"
+                          type="number"
+                          min={1}
+                          max={300}
+                          step={1}
+                          value={featureSelectionMinimum}
+                          disabled={!session || isSubmitting}
+                          onChange={(event) => setFeatureSelectionMinimum(event.currentTarget.value)}
+                        />
+                        {(featureSelectionMethod === "variance_filter" || featureSelectionMethod === "correlation_filter") && (
+                          <TextInput
+                            label={featureSelectionMethod === "variance_filter" ? "Variance threshold" : "Absolute correlation threshold"}
+                            type="number"
+                            min={0}
+                            max={featureSelectionMethod === "variance_filter" ? 1000000000000 : 1}
+                            step="any"
+                            value={featureSelectionThreshold}
+                            disabled={!session || isSubmitting}
+                            onChange={(event) => setFeatureSelectionThreshold(event.currentTarget.value)}
+                          />
+                        )}
+                        {featureSelectionMethod === "extra_trees" && (
+                          <TextInput
+                            label="Extra Trees count"
+                            type="number"
+                            min={10}
+                            max={200}
+                            step={1}
+                            value={featureSelectionTrees}
+                            disabled={!session || isSubmitting}
+                            onChange={(event) => setFeatureSelectionTrees(event.currentTarget.value)}
+                          />
+                        )}
+                        <p className="agent-feature-selection-note">
+                          Preview comparisons are exploratory. Training learns a separate selector in each CV fold; folds can retain different features. The final fitted selector uses training rows only and excludes the holdout. Review the current dataset&apos;s preview in <Link href="/workspace/datasets">Datasets</Link>.
+                        </p>
+                        <p className="agent-feature-selection-summary" aria-live="polite">
+                          Run configuration: {featureSelectionMethod.replaceAll("_", " ")}
+                          {featureSelectionMethod !== "variance_filter" ? ` · up to ${featureSelectionTopK || "20"} features` : ` · threshold ${featureSelectionThreshold || "0"}`}
+                          {` · minimum ${featureSelectionMinimum || "1"}`}
+                          {featureSelectionMethod === "extra_trees" ? ` · ${featureSelectionTrees || "50"} trees` : ""}
+                        </p>
+                      </>
+                    )}
+                  </div>
                 </Card>
               )}
 

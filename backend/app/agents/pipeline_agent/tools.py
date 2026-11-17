@@ -17,6 +17,21 @@ class UnknownToolError(ToolValidationError):
 
 
 _NO_ARGS = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+_FEATURE_SELECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"type": "string", "enum": [
+            "variance_filter", "correlation_filter", "mutual_information",
+            "univariate_test", "extra_trees",
+        ]},
+        "threshold": {"type": "number", "minimum": 0},
+        "top_k": {"type": "integer", "minimum": 1, "maximum": 300},
+        "min_features": {"type": "integer", "minimum": 1, "maximum": 300},
+        "n_estimators": {"type": "integer", "minimum": 10, "maximum": 200},
+    },
+    "required": ["method"],
+    "additionalProperties": False,
+}
 
 TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
@@ -124,6 +139,10 @@ TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                         "minLength": 1,
                         "description": "Optional exact target selected by the user or trusted Advanced Mode request.",
                     },
+                    "feature_selection": {
+                        **copy.deepcopy(_FEATURE_SELECTION_SCHEMA),
+                        "description": "Trusted Advanced Mode feature-selection configuration. User settings override model-proposed values.",
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -209,6 +228,10 @@ TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                         "description": "Use auto to infer the task through Task 07 on training-only rows.",
                     },
                     "reasoning": {"type": "string", "minLength": 1},
+                    "feature_selection": {
+                        **copy.deepcopy(_FEATURE_SELECTION_SCHEMA),
+                        "description": "Trusted user-selected feature selection to include in the proposed plan.",
+                    },
                 },
                 "required": ["target_column", "task_type", "reasoning"],
                 "additionalProperties": False,
@@ -242,6 +265,10 @@ TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                         ],
                     },
                     "language": {"type": "string", "minLength": 1},
+                    "feature_selection": {
+                        **copy.deepcopy(_FEATURE_SELECTION_SCHEMA),
+                        "description": "Trusted Advanced Mode feature-selection configuration.",
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,

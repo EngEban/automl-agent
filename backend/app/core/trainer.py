@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import logging
 import math
+import re
 from io import BytesIO
 from typing import Any
 
@@ -28,7 +30,7 @@ from sklearn.model_selection import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
-from app.config import settings
+from app.config.settings import settings
 from app.core.model_selector import (
     get_candidate_models,
     infer_task_type,
@@ -37,6 +39,11 @@ from app.core.model_selector import (
     model_supports_sparse_input,
 )
 from app.core.memory import SparseToDenseGuard, estimate_dataframe_memory
+from app.core.feature_selection import (
+    FeatureSelectionError,
+    TrainingFeatureSelector,
+    selector_config_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,7 @@ def _report_progress(progress_callback, event_type: str, details: dict[str, Any]
         logger.warning("Training progress event failed (error_type=%s)", type(exc).__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 MAX_PERMUTATION_IMPORTANCE_ROWS = 2_000
+MAX_FEATURE_SELECTION_METADATA_FEATURES = 300
 
 def _to_b64(fig: plt.Figure) -> str:
     buf = BytesIO()
@@ -75,7 +83,13 @@ def _clone_or_copy(value: Any) -> Any:
         return copy.deepcopy(value)
 
 
-def _pipeline(preprocessor: Any, model: Any, projected_rows: int | None = None) -> Pipeline:
+def _pipeline(
+    preprocessor: Any,
+    model: Any,
+    projected_rows: int | None = None,
+    feature_selection_config: dict[str, Any] | None = None,
+    task_type: str | None = None,
+) -> Pipeline:
     fitted_preprocessor = _clone_or_copy(preprocessor)
     if hasattr(fitted_preprocessor, "scale_numeric"):
         fitted_preprocessor.set_params(scale_numeric=model_requires_scaling(model))
@@ -84,11 +98,21 @@ def _pipeline(preprocessor: Any, model: Any, projected_rows: int | None = None) 
         if model_supports_sparse_input(model)
         else SparseToDenseGuard(projected_rows=projected_rows)
     )
-    return Pipeline([
-        ("prep", fitted_preprocessor),
+    steps = [("prep", fitted_preprocessor)]
+    if feature_selection_config is not None:
+        steps.append((
+            "feature_selection",
+            TrainingFeatureSelector(
+                **feature_selection_config,
+                task_type=task_type,
+                memory_limit_mb=float(settings.MAX_DENSE_CONVERSION_MB),
+            ),
+        ))
+    steps.extend([
         ("model_input", model_input),
         ("model", _clone_or_copy(model)),
     ])
+    return Pipeline(steps)
 
 
 def _split_data(X, y, task_type):
@@ -298,6 +322,124 @@ def _apply_training_class_weights(candidates, y_train, task_type):
     return balanced, decision
 
 
+def _source_feature_for_transformed_name(name: str, preprocessor: Any) -> str | None:
+    kept = [str(value) for value in getattr(preprocessor, "kept_columns_", [])]
+    date_match = re.search(r"__automl_date_(\d+)_", name)
+    if date_match:
+        index = int(date_match.group(1))
+        if 0 <= index < len(kept):
+            return kept[index]
+    stripped = name.split("__", 1)[-1]
+    matches = [
+        column for column in kept
+        if stripped == column
+        or stripped.startswith(f"{column}_")
+        or stripped.startswith(f"{column}-")
+    ]
+    return max(matches, key=len) if matches else None
+
+
+def _feature_selection_summary(
+    pipeline: Pipeline,
+    *,
+    fit_rows: int,
+    include_scores: bool,
+    fold: int | None = None,
+) -> dict[str, Any]:
+    selector: TrainingFeatureSelector = pipeline.named_steps["feature_selection"]
+    preprocessor = pipeline.named_steps["prep"]
+    names = [str(value) for value in preprocessor.get_feature_names_out()]
+    if len(names) != selector.n_features_in_:
+        raise FeatureSelectionError(
+            "The fitted preprocessor feature names do not match the selector input dimensions."
+        )
+    selector.feature_names_in_ = np.asarray(names, dtype=object)
+    order = sorted(
+        range(len(names)),
+        key=lambda index: (-float(selector.scores_[index]), index),
+    )
+    ranks = {index: rank for rank, index in enumerate(order, start=1)}
+    selected = []
+    excluded = []
+    for index in order:
+        name = names[index]
+        source = _source_feature_for_transformed_name(name, preprocessor)
+        score = float(selector.scores_[index])
+        if selector.support_[index]:
+            record = {"name": name, "source_feature": source}
+            if include_scores:
+                record.update({"score": score, "rank": ranks[index]})
+            selected.append(record)
+        else:
+            record = {
+                "name": name,
+                "source_feature": source,
+                "reason": selector.excluded_reasons_.get(index, "Not selected by the fitted method."),
+            }
+            if include_scores:
+                record.update({"score": score, "rank": ranks[index]})
+            excluded.append(record)
+
+    if fold is not None:
+        signature = hashlib.sha256(
+            "\0".join(sorted(item["name"] for item in selected)).encode("utf-8")
+        ).hexdigest()
+        return {
+            "fold": fold,
+            "fit_rows": int(fit_rows),
+            "input_features": int(selector.n_features_in_),
+            "retained_features": int(selector.n_features_selected_),
+            "selected_feature_names": [
+                item["name"] for item in selected[:MAX_FEATURE_SELECTION_METADATA_FEATURES]
+            ],
+            "selected_feature_names_truncated": max(
+                0, len(selected) - MAX_FEATURE_SELECTION_METADATA_FEATURES
+            ),
+            "selected_feature_signature": signature,
+        }
+
+    preprocessor_removed = [
+        {"name": str(value), "source_feature": str(value), "reason": "Constant or entirely missing in the fitted preprocessing partition."}
+        for value in getattr(preprocessor, "removed_constant_columns_", [])
+    ]
+    preprocessor_removed.extend(
+        {
+            "name": str(item.get("column")),
+            "source_feature": str(item.get("column")),
+            "reason": f"Exact duplicate of '{item.get('duplicate_of')}' in the fitted preprocessing partition.",
+        }
+        for item in getattr(preprocessor, "removed_duplicate_columns_", [])
+    )
+    selected_details = selected[:MAX_FEATURE_SELECTION_METADATA_FEATURES]
+    excluded_details = excluded[:MAX_FEATURE_SELECTION_METADATA_FEATURES]
+    return {
+        "enabled": True,
+        "method": selector.method,
+        "configuration": {
+            "threshold": selector.threshold,
+            "top_k": selector.requested_top_k_,
+            "effective_top_k": selector.effective_top_k_,
+            "min_features": int(selector.min_features),
+            "n_estimators": int(selector.n_estimators) if selector.method == "extra_trees" else None,
+        },
+        "fit_partition": "training_partition_excluding_holdout",
+        "fit_rows": int(fit_rows),
+        "original_source_features": int(len(getattr(preprocessor, "feature_columns", []))),
+        "input_features": int(selector.n_features_in_),
+        "retained_features": int(selector.n_features_selected_),
+        "selected_feature_names": [item["name"] for item in selected_details],
+        "selected_feature_names_truncated": max(0, len(selected) - len(selected_details)),
+        "selected_features": selected_details,
+        "excluded_features": [*excluded_details, *preprocessor_removed[:MAX_FEATURE_SELECTION_METADATA_FEATURES]],
+        "excluded_features_truncated": max(
+            0,
+            len(excluded) + len(preprocessor_removed)
+            - len(excluded_details)
+            - min(len(preprocessor_removed), MAX_FEATURE_SELECTION_METADATA_FEATURES),
+        ),
+    }
+
+
 def _cross_validation_metrics(
     preprocessor,
     model,
@@ -307,33 +449,62 @@ def _cross_validation_metrics(
     splitter,
     projected_rows=None,
     cancel_check=None,
+    feature_selection_config=None,
+    return_feature_selection=False,
 ):
     if splitter is None:
         raise ValueError("No defensible training-only cross-validation split is available.")
 
     fold_metrics = []
-    for train_indices, validation_indices in splitter.split(X, y):
+    fold_selection = []
+    for fold_index, (train_indices, validation_indices) in enumerate(splitter.split(X, y), start=1):
         _raise_if_cancelled(cancel_check)
-        fold_pipeline = _pipeline(preprocessor, model, projected_rows=projected_rows)
+        fold_pipeline = _pipeline(
+            preprocessor,
+            model,
+            projected_rows=projected_rows,
+            feature_selection_config=feature_selection_config,
+            task_type=task_type,
+        )
         X_fold_train = X.iloc[train_indices]
         y_fold_train = y.iloc[train_indices]
         X_fold_validation = X.iloc[validation_indices]
         y_fold_validation = y.iloc[validation_indices]
-        fold_pipeline.fit(X_fold_train, y_fold_train)
+        try:
+            fold_pipeline.fit(X_fold_train, y_fold_train)
+        except FeatureSelectionError:
+            raise
+        if feature_selection_config is not None and return_feature_selection:
+            fold_selection.append(_feature_selection_summary(
+                fold_pipeline,
+                fit_rows=len(X_fold_train),
+                include_scores=False,
+                fold=fold_index,
+            ))
         validation_predictions = fold_pipeline.predict(X_fold_validation)
         fold_metrics.append(
             _calculate_metrics(y_fold_validation, validation_predictions, task_type)
         )
 
     metric_names = fold_metrics[0].keys()
-    return {
+    metrics = {
         metric: float(np.mean([fold[metric] for fold in fold_metrics]))
         for metric in metric_names
     }
+    return (metrics, fold_selection) if return_feature_selection else metrics
 
 
-def _fit_full_pipeline(preprocessor, model, X, y, projected_rows=None):
-    pipe = _pipeline(preprocessor, model, projected_rows=projected_rows)
+def _fit_full_pipeline(
+    preprocessor, model, X, y, projected_rows=None,
+    feature_selection_config=None, task_type=None,
+):
+    pipe = _pipeline(
+        preprocessor,
+        model,
+        projected_rows=projected_rows,
+        feature_selection_config=feature_selection_config,
+        task_type=task_type,
+    )
     pipe.fit(X, y)
     return pipe
 
@@ -343,7 +514,7 @@ def _fit_full_pipeline(preprocessor, model, X, y, projected_rows=None):
 # ==========================================
 def _tune_with_optuna(
     preprocessor, model, X_train, y_train, task_type, primary_metric,
-    projected_rows=None, cancel_check=None,
+    projected_rows=None, cancel_check=None, feature_selection_config=None,
 ):
     """Tune RandomForest or HistGradientBoosting using Optuna."""
     model_name = type(model).__name__
@@ -377,6 +548,11 @@ def _tune_with_optuna(
         trial_model = _clone_or_copy(model)
         trial_model.set_params(**params)
         cv_options = {"projected_rows": projected_rows}
+        if feature_selection_config is not None:
+            cv_options.update({
+                "feature_selection_config": feature_selection_config,
+                "return_feature_selection": False,
+            })
         if cancel_check is not None:
             cv_options["cancel_check"] = cancel_check
         metrics = _cross_validation_metrics(
@@ -399,6 +575,8 @@ def _tune_with_optuna(
         tuned_model.set_params(**best_params)
         return tuned_model, best_params
     except TrainingCancelled:
+        raise
+    except FeatureSelectionError:
         raise
     except Exception as e:
         logger.warning("Optuna tuning failed; keeping CV-selected defaults: %s", e)
@@ -452,8 +630,10 @@ def train_and_evaluate(
     target_name: str | None = None,
     cancel_check=None,
     progress_callback=None,
+    feature_selection_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _raise_if_cancelled(cancel_check)
+    feature_selection_config = selector_config_dict(feature_selection_config)
     if not (
         isinstance(X.index, pd.RangeIndex)
         and X.index.start == 0
@@ -541,6 +721,7 @@ def train_and_evaluate(
     )
     results, failures = [], []
     best_score, selected_model, best_name = -np.inf, None, ""
+    best_fold_selection: list[dict[str, Any]] = []
     primary_metric = "F1_Weighted" if task_type == "classification" else "R2"
 
     # Candidate comparison uses only CV folds within the training partition.
@@ -550,7 +731,12 @@ def train_and_evaluate(
             cv_options = {"projected_rows": len(X)}
             if cancel_check is not None:
                 cv_options["cancel_check"] = cancel_check
-            metrics = _cross_validation_metrics(
+            if feature_selection_config is not None:
+                cv_options.update({
+                    "feature_selection_config": feature_selection_config,
+                    "return_feature_selection": True,
+                })
+            cv_result = _cross_validation_metrics(
                 preprocessor,
                 model,
                 X_train,
@@ -559,6 +745,10 @@ def train_and_evaluate(
                 splitter,
                 **cv_options,
             )
+            if feature_selection_config is not None:
+                metrics, fold_selection = cv_result
+            else:
+                metrics, fold_selection = cv_result, []
             results.append({"model": name, **metrics})
             _report_progress(
                 progress_callback,
@@ -568,7 +758,10 @@ def train_and_evaluate(
             score = metrics.get(primary_metric, -np.inf)
             if np.isfinite(score) and score > best_score:
                 best_score, selected_model, best_name = float(score), model, name
+                best_fold_selection = fold_selection
         except TrainingCancelled:
+            raise
+        except FeatureSelectionError:
             raise
         except Exception as exc:
             failures.append({"model": name, "error": str(exc)})
@@ -607,13 +800,19 @@ def train_and_evaluate(
             primary_metric,
             projected_rows=len(X),
             cancel_check=cancel_check,
+            feature_selection_config=feature_selection_config,
         )
         if tuning_params:
             try:
                 cv_options = {"projected_rows": len(X)}
                 if cancel_check is not None:
                     cv_options["cancel_check"] = cancel_check
-                tuned_cv_metrics = _cross_validation_metrics(
+                if feature_selection_config is not None:
+                    cv_options.update({
+                        "feature_selection_config": feature_selection_config,
+                        "return_feature_selection": True,
+                    })
+                tuned_cv_result = _cross_validation_metrics(
                     preprocessor,
                     selected_model,
                     X_train,
@@ -624,6 +823,8 @@ def train_and_evaluate(
                 )
             except TrainingCancelled:
                 raise
+            except FeatureSelectionError:
+                raise
             except Exception:
                 logger.exception(
                     "Tuned model failed its final training-only CV comparison; "
@@ -632,6 +833,10 @@ def train_and_evaluate(
                 selected_model = selected_model_before_tuning
                 tuning_params = {}
             else:
+                if feature_selection_config is not None:
+                    tuned_cv_metrics, best_fold_selection = tuned_cv_result
+                else:
+                    tuned_cv_metrics = tuned_cv_result
                 best_score = float(tuned_cv_metrics[primary_metric])
                 for result in results:
                     if result["model"] == best_name:
@@ -640,10 +845,28 @@ def train_and_evaluate(
 
     # Evaluate exactly one training-fitted pipeline on the untouched holdout.
     _raise_if_cancelled(cancel_check)
-    evaluation_pipeline = _pipeline(preprocessor, selected_model, projected_rows=len(X))
+    evaluation_pipeline = _pipeline(
+        preprocessor,
+        selected_model,
+        projected_rows=len(X),
+        feature_selection_config=feature_selection_config,
+        task_type=task_type,
+    )
     evaluation_pipeline.fit(X_train, y_train)
     holdout_predictions = evaluation_pipeline.predict(X_test)
     final_test_metrics = _calculate_metrics(y_test, holdout_predictions, task_type)
+    feature_selection = (
+        _feature_selection_summary(
+            evaluation_pipeline,
+            fit_rows=len(X_train),
+            include_scores=True,
+        )
+        if feature_selection_config is not None
+        else {"enabled": False}
+    )
+    if feature_selection_config is not None:
+        feature_selection["cross_validation_folds"] = best_fold_selection
+        feature_selection["cross_validation_fit_rows"] = int(len(X_train))
 
     # Charts and permutation importance describe the same independent holdout.
     extra_charts = {}
@@ -697,9 +920,14 @@ def train_and_evaluate(
     # Only after all independent evaluation work is complete, refit a fresh
     # production pipeline on every available row.
     _raise_if_cancelled(cancel_check)
-    production_pipeline = _fit_full_pipeline(
-        preprocessor, selected_model, X, y, projected_rows=len(X)
-    )
+    if feature_selection_config is None:
+        production_pipeline = _fit_full_pipeline(
+            preprocessor, selected_model, X, y, projected_rows=len(X)
+        )
+    else:
+        # Preserve the independently evaluated training-only selector and model.
+        # Refitting on all rows would leak holdout information into the artifact.
+        production_pipeline = evaluation_pipeline
     fitted_preprocessing = list(
         getattr(production_pipeline.named_steps["prep"], "operations_", [])
     )
@@ -715,6 +943,16 @@ def train_and_evaluate(
         selected_model
     )
     memory_summary["permutation_importance_rows"] = int(len(importance_X))
+    if feature_selection_config is not None:
+        fitted_preprocessing.append({
+            "type": "feature_selection",
+            "method": feature_selection["method"],
+            "configuration": feature_selection["configuration"],
+            "input_features": feature_selection["input_features"],
+            "retained_features": feature_selection["retained_features"],
+            "fit_rows": feature_selection["fit_rows"],
+            "fit_partition": feature_selection["fit_partition"],
+        })
     if imbalance_operation is not None:
         fitted_preprocessing.append(imbalance_operation)
     evaluation = {
@@ -733,6 +971,7 @@ def train_and_evaluate(
         "task_type": task_type,
         "target_encoder": target_encoder,
         "preprocessing_operations": fitted_preprocessing,
+        "feature_selection": feature_selection,
         "results": results,
         "best_model": production_pipeline,
         "best_model_name": best_name,

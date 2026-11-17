@@ -68,6 +68,28 @@ class EvaluationFacts(StrictModel):
     metrics: dict[StrictStr, float | int | None] = Field(default_factory=dict)
 
 
+class SelectedFeatureFact(StrictModel):
+    name: StrictStr
+    source_feature: StrictStr | None = None
+    score: float | None = None
+    rank: StrictInt | None = None
+
+
+class FeatureSelectionFacts(StrictModel):
+    available: StrictBool = False
+    enabled: StrictBool = False
+    method: StrictStr | None = None
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    fit_rows: StrictInt | None = None
+    original_source_features: StrictInt | None = None
+    input_features: StrictInt | None = None
+    retained_features: StrictInt | None = None
+    selected_feature_names_truncated: StrictInt = 0
+    cross_validation_fold_count: StrictInt | None = None
+    folds_selected_different_features: StrictBool | None = None
+    selected_features: list[SelectedFeatureFact] = Field(default_factory=list, max_length=300)
+
+
 class ReportFacts(StrictModel):
     report_id: StrictStr = Field(min_length=1, max_length=128)
     analysis_id: StrictStr = Field(min_length=1, max_length=128)
@@ -81,6 +103,7 @@ class ReportFacts(StrictModel):
     cv_selection_score: float | None
     cv_results: list[ModelMetrics] = Field(min_length=1, max_length=50)
     holdout: EvaluationFacts
+    feature_selection: FeatureSelectionFacts = Field(default_factory=FeatureSelectionFacts)
     preprocessing_operations: list[StrictStr] = Field(default_factory=list, max_length=50)
     explainability_available: StrictBool
     available_figures: list[StrictStr] = Field(default_factory=list, max_length=20)

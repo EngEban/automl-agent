@@ -111,6 +111,62 @@ def _safe_parameters(value: Any) -> dict[str, Any]:
     return result
 
 
+def _feature_selection_facts(value: Any) -> dict[str, Any]:
+    raw = _mapping(value)
+    available = isinstance(raw.get("enabled"), bool)
+    enabled = raw.get("enabled") is True
+    selected = []
+    if enabled:
+        entries = raw.get("selected_features")
+        if isinstance(entries, (list, tuple)):
+            for entry in entries[:300]:
+                item = _mapping(entry)
+                name = _text(item.get("name"), limit=256)
+                if not name:
+                    continue
+                selected.append({
+                    "name": name,
+                    "source_feature": _text(item.get("source_feature"), limit=256),
+                    "score": _number(item.get("score")),
+                    "rank": _integer(item.get("rank")),
+                })
+    method = _text(raw.get("method"), limit=80) if enabled else None
+    raw_folds = raw.get("cross_validation_folds")
+    fold_names = []
+    if enabled and isinstance(raw_folds, (list, tuple)):
+        for fold in raw_folds[:10]:
+            item = _mapping(fold)
+            signature = _text(item.get("selected_feature_signature"), limit=128)
+            if signature:
+                fold_names.append(("signature", signature))
+                continue
+            names = item.get("selected_feature_names")
+            if isinstance(names, (list, tuple)):
+                fold_names.append(("names", tuple(str(name) for name in names if isinstance(name, str))))
+    allowed_methods = {
+        "variance_filter", "correlation_filter", "mutual_information",
+        "univariate_test", "extra_trees",
+    }
+    if method not in allowed_methods:
+        method = None
+        enabled = False
+        selected = []
+    return {
+        "available": available,
+        "enabled": enabled,
+        "method": method,
+        "configuration": _safe_parameters(raw.get("configuration")) if enabled else {},
+        "fit_rows": _integer(raw.get("fit_rows")) if enabled else None,
+        "original_source_features": _integer(raw.get("original_source_features")) if enabled else None,
+        "input_features": _integer(raw.get("input_features")) if enabled else None,
+        "retained_features": _integer(raw.get("retained_features")) if enabled else None,
+        "selected_feature_names_truncated": _integer(raw.get("selected_feature_names_truncated")) or 0 if enabled else 0,
+        "cross_validation_fold_count": len(fold_names) if enabled else None,
+        "folds_selected_different_features": len(set(fold_names)) > 1 if enabled and fold_names else None,
+        "selected_features": selected,
+    }
+
+
 def build_report_facts(
     *,
     report_id: str,
@@ -233,6 +289,7 @@ def build_report_facts(
         if _text(_mapping(model_registry).get(key), limit=160)
     }
     preprocessing = _operation_labels(training, operations)
+    feature_selection = _feature_selection_facts(training.get("feature_selection"))
     parameters = _safe_parameters(training.get("tuning_params"))
     optimization_performed = bool(parameters)
 
@@ -274,6 +331,11 @@ def build_report_facts(
             if explainability_available
             else "Explainability outputs are unavailable."
         ),
+        "training.feature_selection": (
+            "A validated training feature selector and its selected transformed features are recorded."
+            if feature_selection["enabled"]
+            else "Feature selection was disabled or was not recorded for this run."
+        ),
         "analysis.limitations": "Limitations are derived from the recorded analysis facts.",
     }
     if source_rows is not None:
@@ -308,6 +370,7 @@ def build_report_facts(
             "cv_selection_score": best_score,
             "cv_results": normalized_rows,
             "holdout": holdout,
+            "feature_selection": feature_selection,
             "preprocessing_operations": preprocessing,
             "explainability_available": explainability_available,
             "available_figures": available_figures,

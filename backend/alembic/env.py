@@ -4,10 +4,9 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.config import settings
+from app.config.settings import settings
 from app.db.base import Base
 
-# استيراد جميع الموديلات لكي يتعرف عليها Alembic ويقوم بإنشاء الجداول
 from app.db.models import User, Session, Message, Operation, Artifact, AnalysisRun, RunEvent
 
 config = context.config
@@ -15,7 +14,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# تمرير رابط قاعدة البيانات من إعداداتنا
+
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 target_metadata = Base.metadata
@@ -47,7 +46,7 @@ def run_migrations_online() -> None:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            compare_type=True,  # لاكتشاف تغييرات أنواع البيانات
+            compare_type=True,
         )
 
         with context.begin_transaction():

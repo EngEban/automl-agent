@@ -14,6 +14,7 @@ import { getAgentSession, listAgentSessions } from "@/features/agent-workspace/a
 import { ApiError, ApiTimeoutError } from "@/lib/api/client";
 import type { SessionDetails, SessionListItem } from "@/types/api";
 import { Modal } from "@/components/ui/modal";
+import { FeatureExplorationPanel } from "@/features/datasets/feature-exploration-panel";
 
 const SESSION_PAGE_SIZE = 50;
 
@@ -90,7 +91,15 @@ function SessionListSkeleton() {
   );
 }
 
-function DatasetDetails({ session }: { session: SessionDetails }) {
+function DatasetDetails({
+  session,
+  token,
+  onUnauthorized,
+}: {
+  session: SessionDetails;
+  token: string;
+  onUnauthorized: () => void;
+}) {
   const metadata = session.dataset_meta ?? {};
   const columns = metadataColumns(metadata);
   const dtypes = typeof metadata.dtypes === "object" && metadata.dtypes !== null && !Array.isArray(metadata.dtypes)
@@ -163,6 +172,13 @@ function DatasetDetails({ session }: { session: SessionDetails }) {
           {columns.length > 24 && <p className="dataset-column-note">Showing the first 24 of {columns.length.toLocaleString()} returned columns.</p>}
         </section>
       )}
+
+      <FeatureExplorationPanel
+        key={session.id}
+        session={session}
+        token={token}
+        onUnauthorized={onUnauthorized}
+      />
     </div>
   );
 }
@@ -452,8 +468,8 @@ function DatasetsPageContent() {
             <Alert tone="error" title="Could not load details">{detailError}</Alert>
             <Button type="button" variant="outline" onClick={retrySessionDetails}>Try again</Button>
           </div>
-        ) : selectedSession ? (
-          <DatasetDetails session={selectedSession} />
+        ) : selectedSession && accessToken ? (
+          <DatasetDetails session={selectedSession} token={accessToken} onUnauthorized={logout} />
         ) : null}
       </Modal>
     </>

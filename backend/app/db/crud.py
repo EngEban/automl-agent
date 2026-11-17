@@ -166,6 +166,16 @@ def get_run(db: DBSession, run_id: str) -> Optional[AnalysisRun]:
     except Exception:
         return None
 
+
+def get_run_by_task_id(db: DBSession, task_id: str) -> Optional[AnalysisRun]:
+    """Resolve one Celery task to its persisted owner/session record.
+
+    Duplicate task IDs are treated as ambiguous and fail closed.
+    """
+    stmt = select(AnalysisRun).where(AnalysisRun.task_id == task_id).limit(2)
+    matches = list(db.scalars(stmt).all())
+    return matches[0] if len(matches) == 1 else None
+
 def update_run(
     db: DBSession,
     run_id: str,

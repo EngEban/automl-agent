@@ -7,7 +7,7 @@
 - An Ollama endpoint or another supported LiteLLM provider for live Pipeline Agent requests.
 - Groq credentials only if live Report Agent generation is enabled.
 
-The backend can be imported and its automated tests can run without PostgreSQL, Redis, Kaggle credentials, or live LLM requests.
+The backend can be imported and its automated tests can run without PostgreSQL, Redis, Kaggle credentials, or live LLM requests. Runtime dependencies are pinned in `backend/requirements.txt`; test and development dependencies are in `backend/requirements-dev.txt`, which includes the runtime file.
 
 ## Environment
 
@@ -20,6 +20,18 @@ PowerShell:
 Configure the host-side DATABASE_URL, optional Compose DATABASE_URL_DOCKER, POSTGRES_* values, Redis URLs, CORS origins, and the two separate agent configurations. REPORT_AGENT_ENABLED defaults to false; provide a valid Report Agent key before enabling live Groq generation. The Next.js frontend has its own non-secret NEXT_PUBLIC_API_BASE_URL setting in frontend/.env.example.
 
 Percent-encode URL-reserved characters in database passwords inside both database URLs; for example, encode @ as %40.
+
+## User-managed provider credentials
+
+Provider profiles store credentials only as Fernet authenticated ciphertext. Set PROVIDER_CREDENTIAL_ENCRYPTION_KEY in the backend-only root .env; never put it in a frontend environment file, commit it, reuse SECRET_KEY, or store it in the database. The application does not require this key at startup. Credential create/replace operations fail closed until a valid key is configured.
+
+Generate a Fernet key in a trusted local shell and copy it directly into the backend .env:
+
+    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+The example value in .env.example is deliberately not a valid key. The API exposes only whether a credential is configured; it never returns saved secrets or ciphertext. Provider connection checks are explicit user-triggered requests and use short synthetic prompts without datasets or chat history.
+
+Credential ciphertext is versioned (enc:v1:). Do not replace the active key while v1 credentials exist: they would become unreadable. A future rotation must add a key ring that can decrypt the old version and encrypt a new version, re-encrypt each row in a controlled transaction or resumable batch, verify all rows, and only then retire the old key. Back up the encrypted database and old key securely before rotation; never log or expose either key.
 
 ## Docker Compose development
 
@@ -40,7 +52,9 @@ From the repository root:
     cd backend
     python -m venv .venv
     .\.venv\Scripts\Activate.ps1
-    python -m pip install -r requirements.txt
+    python -m pip install -r requirements-dev.txt
+
+Production/runtime installations use `python -m pip install -r requirements.txt` instead. Docker runtime images also install only `requirements.txt`.
 
 Start the local API after configuring PostgreSQL and Redis:
 

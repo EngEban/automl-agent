@@ -78,7 +78,11 @@ function WorkspaceSidebar({ collapsed, onToggle, onNavigate, activeItem, homeHre
         ))}
       </nav>
       <div className="sidebar-footer">
-        <SidebarNavItem item={{ label: "Settings", icon: Settings2 }} collapsed={collapsed} />
+        <SidebarNavItem
+          item={{ label: "Settings", icon: Settings2, href: "/workspace/settings/ai-providers", active: activeItem === "Settings" }}
+          collapsed={collapsed}
+          onNavigate={onNavigate}
+        />
         <div className="sidebar-build-note"><span className="sidebar-build-dot" /> <span>AutoML Agent</span></div>
       </div>
     </aside>

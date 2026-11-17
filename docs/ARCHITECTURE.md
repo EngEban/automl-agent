@@ -6,15 +6,16 @@
 - app.worker.worker:celery_app is the Celery entry point. Its explicit task include list registers the legacy analyze_dataset task and the current run_agent_task.
 - Alembic migrations are the only schema upgrade path. Application import does not call create_all().
 
-Settings are loaded through Pydantic Settings. Importing the app creates the SQLAlchemy engine and Celery objects and ensures storage directories, but does not connect to PostgreSQL or Redis. Kaggle API authentication is deferred until a connector instance is created. LLM and email network calls occur only when the corresponding operation is invoked.
+Settings are loaded from `app.config.settings` through Pydantic Settings, and backend modules use the canonical `app.*` import namespace. Importing the app creates the SQLAlchemy engine and Celery objects and ensures storage directories, but does not connect to PostgreSQL or Redis. Kaggle API authentication is deferred until a connector instance is created. LLM and email network calls occur only when the corresponding operation is invoked.
 
 ## Package responsibilities
 
 | Package | Responsibility |
 | --- | --- |
 | app/api/routes and app/schemas | FastAPI endpoints, authentication dependencies, request validation, and response contracts. |
-| app/agent | Ollama-capable Pipeline Agent: request planning, tool schemas, validation, execution, and conversation memory. |
+| app/agents/pipeline_agent | Pipeline Agent: request planning, tool schemas, validation, execution, and conversation memory. |
 | app/agents/report_agent | Independent Groq and LangGraph report workflow, report validation, facts, HTML rendering, and PDF orchestration. |
+| app/config | Pydantic settings model and the shared settings instance. |
 | app/core | Dataset loading and profiling, EDA, target/task inference, preprocessing, training, memory guards, code generation, and run lifecycle helpers. |
 | app/services | Session, authentication, inference, notification, and run orchestration. |
 | app/tasks | Celery tasks for the retained legacy analysis flow and current run-based Agent flow. |

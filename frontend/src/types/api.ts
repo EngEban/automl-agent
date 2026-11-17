@@ -53,6 +53,20 @@ export interface DashboardSession extends SessionListItem {
 export interface AnalysisOptions {
   target_column?: string;
   task_type?: "classification" | "regression";
+  feature_selection?: FeatureSelectionConfig;
+}
+
+export interface FeatureSelectionConfig {
+  method:
+    | "variance_filter"
+    | "correlation_filter"
+    | "mutual_information"
+    | "univariate_test"
+    | "extra_trees";
+  threshold?: number;
+  top_k?: number;
+  min_features?: number;
+  n_estimators?: number;
 }
 
 export interface ChatRequest {

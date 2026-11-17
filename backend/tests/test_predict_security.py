@@ -10,7 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.routes import predict as predict_routes
-from app.config import settings
+from app.config.settings import settings
 from app.schemas.predict import PredictRequest, PredictResponse
 from app.services import inference_service
 

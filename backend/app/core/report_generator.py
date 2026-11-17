@@ -14,7 +14,7 @@ from typing import Any
 from jinja2 import Environment, select_autoescape
 from playwright.sync_api import sync_playwright
 
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 

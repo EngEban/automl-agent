@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 

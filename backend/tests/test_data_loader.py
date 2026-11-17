@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.config import settings
+from app.config.settings import settings
 from app.core import data_loader
 from app.core.data_loader import DataLoadError, _clean_columns
 

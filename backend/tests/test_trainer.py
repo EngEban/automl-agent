@@ -12,7 +12,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 
-from backend.app.agents.ml_pipeline_agent import executor
+from app.agents.pipeline_agent import executor
 from app.core import trainer
 from app.core import code_generator
 from app.core.memory import DenseConversionLimitError
@@ -523,6 +523,34 @@ def test_generated_notebook_splits_before_target_encoding_and_compiles(monkeypat
     assert "dropna(axis=1, how='all')" not in prepare_cell
     assert "keep_empty_features=True" in preprocessing_cell
     assert "max_categories=50" in preprocessing_cell
+
+
+def test_generated_notebook_labels_recorded_selection_without_claiming_to_refit_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(code_generator.settings, "STORAGE_DIR", tmp_path)
+    notebook_path = code_generator.generate_notebook(
+        session_id="notebook-selection",
+        dataset_filename="sample.csv",
+        target_column="label",
+        task_type="classification",
+        best_model_name="DecisionTree",
+        feature_selection={
+            "enabled": True,
+            "method": "mutual_information",
+            "input_features": 8,
+            "retained_features": 3,
+            "fit_rows": 64,
+        },
+    )
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    markdown = "\n".join(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "markdown"
+    )
+
+    assert "mutual_information" in markdown
+    assert "holdout rows were excluded" in markdown
+    assert "does not refit this recorded selector" in markdown
 
 
 def test_agent_preprocessing_step_does_not_fit_a_full_dataset_transformer(

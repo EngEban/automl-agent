@@ -12,7 +12,7 @@ from jinja2 import Environment
 
 from app.agents.report_agent.facts_builder import ALLOWED_FIGURES
 from app.agents.report_agent.schemas import ReportDocument, ReportFacts
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 MAX_FIGURE_BYTES = 8 * 1024 * 1024
@@ -114,6 +114,25 @@ REPORT_HTML = """<!doctype html>
   <div class="evidence"><strong>Evidence:</strong> {% for ref in section.evidence_refs %}{{ facts.evidence.get(ref, "") }}{% if not loop.last %} {% endif %}{% endfor %}</div>
 </section>
 {% endfor %}
+{% if facts.feature_selection.enabled %}
+<section id="feature-selection">
+  <h2>Training feature selection</h2>
+  <p>The {{ facts.feature_selection.method }} selector was fitted on training rows only. Holdout rows were excluded from selector fitting. These results are separate from independent holdout evaluation and permutation importance.</p>
+  <table><tbody>
+    <tr><th>Original source features</th><td>{{ facts.feature_selection.original_source_features if facts.feature_selection.original_source_features is not none else "Unavailable" }}</td></tr>
+    <tr><th>Transformed input features</th><td>{{ facts.feature_selection.input_features if facts.feature_selection.input_features is not none else "Unavailable" }}</td></tr>
+    <tr><th>Selected transformed features</th><td>{{ facts.feature_selection.retained_features if facts.feature_selection.retained_features is not none else "Unavailable" }}</td></tr>
+    <tr><th>Training rows used to fit selector</th><td>{{ facts.feature_selection.fit_rows if facts.feature_selection.fit_rows is not none else "Unavailable" }}</td></tr>
+    {% if facts.feature_selection.cross_validation_fold_count is not none %}<tr><th>Fold-specific selector fits</th><td>{{ facts.feature_selection.cross_validation_fold_count }}</td></tr>{% endif %}
+    {% for key,value in facts.feature_selection.configuration.items() %}<tr><th>{{ key }}</th><td>{{ value }}</td></tr>{% endfor %}
+  </tbody></table>
+  {% if facts.feature_selection.folds_selected_different_features is not none %}<p>Selected feature sets {% if facts.feature_selection.folds_selected_different_features %}differed{% else %}were consistent{% endif %} across cross-validation folds. Selector scores are method-specific.</p>{% endif %}
+  {% if facts.feature_selection.selected_features %}<h3>Selected transformed features</h3><table><thead><tr><th>Feature</th><th>Source feature</th><th>Training selector score</th><th>Rank</th></tr></thead><tbody>{% for feature in facts.feature_selection.selected_features %}<tr><td>{{ feature.name }}</td><td>{{ feature.source_feature or "Unavailable" }}</td><td>{{ feature.score if feature.score is not none else "Unavailable" }}</td><td>{{ feature.rank if feature.rank is not none else "Unavailable" }}</td></tr>{% endfor %}</tbody></table>{% endif %}
+  {% if facts.feature_selection.selected_feature_names_truncated %}<p>For report size, feature details are limited to the first 300 selected transformed features; the registry artifact retains the fitted selector and complete inference behavior.</p>{% endif %}
+</section>
+{% elif facts.feature_selection.available %}
+<section id="feature-selection"><h2>Training feature selection</h2><p>Feature selection was disabled for this training run.</p></section>
+{% endif %}
 <footer>Generated from validated AutoML analysis facts. Numeric results above are supplied by the analysis backend.</footer>
 </body></html>"""
 

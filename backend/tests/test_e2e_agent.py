@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from backend.app.agents.ml_pipeline_agent import agent as agent_module
-from backend.app.agents.ml_pipeline_agent.llm import extract_message
+from app.agents.pipeline_agent import agent as agent_module
+from app.agents.pipeline_agent.llm import extract_message
 
 
 class _NoopToolSession:
@@ -58,7 +58,7 @@ def test_agent_executes_tool_then_finishes_without_argument_crash():
     persisted = []
     llm_call_messages = []
 
-    async def fake_chat(*, messages, tools):
+    async def fake_chat(*, messages, tools, provider=None):
         llm_call_messages.append(messages)
         return responses.pop(0)
 
@@ -119,7 +119,7 @@ def test_agent_stops_after_tool_error_without_retrying():
     persisted = []
     llm_calls = 0
 
-    async def fake_chat(*, messages, tools):
+    async def fake_chat(*, messages, tools, provider=None):
         nonlocal llm_calls
         llm_calls += 1
         if llm_calls == 1:

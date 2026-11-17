@@ -11,7 +11,7 @@ import pandas as pd
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 
-from app.config import settings
+from app.config.settings import settings
 
 _BYTES_PER_MB = 1024 * 1024
 

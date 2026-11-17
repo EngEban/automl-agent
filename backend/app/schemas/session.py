@@ -22,7 +22,6 @@ class SessionRead(BaseModel):
     id: str
     name: str
     source_type: str
-    source_path: str
     target_column: Optional[str] = None
     task_type: Optional[str] = None
     status: str
@@ -50,4 +49,3 @@ class SessionCreateKaggle(BaseModel):
     kaggle_ref: str = Field(..., description="Kaggle dataset ID (e.g., 'uciml/iris')")
     target_column: Optional[str] = None
     notes: Optional[str] = None
-    

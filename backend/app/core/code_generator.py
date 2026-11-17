@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path, PurePosixPath
 
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,7 @@ def generate_notebook(
     task_type: str,
     best_model_name: str,
     tuning_params: dict | None = None,
+    feature_selection: dict | None = None,
 ) -> Path:
     """Generate a portable .ipynb file and return its path."""
     expected_filename = _portable_filename(dataset_filename)
@@ -303,21 +304,43 @@ print("Model trained successfully.")
 y_pred = pipeline.predict(X_test)
 """ + _evaluation_code(task_type)
 
+    notebook_cells = [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": _source_lines(
+                f"# AutoML Agent: Reproducible Pipeline\n\nTarget: `{target_column}`\n\nTask: `{task_type}`\n\nModel: `{best_model_name}`"
+            ),
+        },
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(imports)},
+        {"cell_type": "markdown", "metadata": {}, "source": _source_lines(dataset_instructions)},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(load_dataset)},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(prepare_data)},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(preprocessing)},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(training)},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(evaluation)},
+    ]
+    recorded_selection = feature_selection if isinstance(feature_selection, dict) else {}
+    if recorded_selection.get("enabled") is True:
+        selection_markdown = (
+            "## Recorded feature-selection result\n\n"
+            f"The original AutoML training run applied `{recorded_selection.get('method', 'unknown')}` "
+            f"to {recorded_selection.get('input_features', 'unknown')} transformed training features and retained "
+            f"{recorded_selection.get('retained_features', 'unknown')}. The selector was fitted on the final "
+            "training partition only; holdout rows were excluded. The folds may select different feature sets.\n\n"
+            "The notebook below is a portable estimator retraining example and does not refit this recorded "
+            "selector. Its outputs must not be interpreted as a reproduction of the selected-feature model. "
+            "Use the registered model artifact for inference with the fitted selector. The registered model "
+            "metrics contain the recorded transformed feature names and scores."
+        )
+        notebook_cells.insert(1, {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": _source_lines(selection_markdown),
+        })
+
     notebook = {
-        "cells": [
-            {
-                "cell_type": "markdown",
-                "metadata": {},
-                "source": _source_lines(f"# AutoML Agent: Reproducible Pipeline\n\nTarget: `{target_column}`\n\nTask: `{task_type}`\n\nModel: `{best_model_name}`"),
-            },
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(imports)},
-            {"cell_type": "markdown", "metadata": {}, "source": _source_lines(dataset_instructions)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(load_dataset)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(prepare_data)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(preprocessing)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(training)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _source_lines(evaluation)},
-        ],
+        "cells": notebook_cells,
         "metadata": {
             "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
             "language_info": {"codemirror_mode": {"name": "ipython", "version": 3}, "file_extension": ".py", "mimetype": "text/x-python", "name": "python", "nbconvert_exporter": "python", "pygments_lexer": "ipython3", "version": "3.11.9"},

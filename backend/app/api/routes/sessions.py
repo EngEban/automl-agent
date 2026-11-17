@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Response
+import pandas as pd
 
 from app.api.deps import DB, CurrentUser
-from app.config import settings
+from app.config.settings import settings
 from app.db import crud
 from app.schemas.session import (
     SessionCreateURL,
@@ -19,6 +21,7 @@ from app.schemas.session import (
     SessionRead,
     SessionCreateKaggle,
 )
+from app.schemas.feature_analysis import FeatureAnalysisRead, FeatureAnalysisRequest
 from app.services import session_service
 
 logger = logging.getLogger(__name__)
@@ -117,6 +120,78 @@ def get_session(session_id: str, db: DB, current_user: CurrentUser) -> SessionRe
     if obj is None or obj.user_id != current_user.id:
         raise HTTPException(404, "Session not found")
     return SessionRead.model_validate(obj)
+
+
+@router.post(
+    "/{session_id}/feature-analysis",
+    response_model=FeatureAnalysisRead,
+)
+def analyze_session_features(
+    session_id: str,
+    payload: FeatureAnalysisRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> FeatureAnalysisRead:
+    """Return a bounded profile and optional training-only selector comparison."""
+    try:
+        canonical_id = str(uuid.UUID(session_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+
+    session = crud.get_session(db, canonical_id)
+    if session is None or str(session.user_id) != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sessions_root = (settings.STORAGE_DIR / "sessions").resolve()
+    try:
+        session_dir = (sessions_root / canonical_id).resolve(strict=True)
+        session_dir.relative_to(sessions_root)
+        dataset_path = session_dir / "raw.pkl"
+        resolved_path = dataset_path.resolve(strict=True)
+        resolved_path.relative_to(session_dir)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The saved dataset is unavailable for feature analysis.",
+        ) from exc
+    if not resolved_path.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="The saved dataset is unavailable for feature analysis.",
+        )
+
+    try:
+        frame = pd.read_pickle(resolved_path)
+        from app.core.feature_explorer import explore_features
+
+        target_column = (
+            payload.target_column
+            if "target_column" in payload.model_fields_set
+            else session.target_column
+        )
+        task_type = (
+            payload.task_type
+            if "task_type" in payload.model_fields_set
+            else session.task_type
+        )
+        result = explore_features(
+            frame,
+            target_column=target_column,
+            task_type=task_type,
+            max_features=payload.max_features,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning(
+            "Feature analysis failed for an owned session (error_type=%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Feature analysis could not be completed for this dataset.",
+        ) from exc
+    return FeatureAnalysisRead.model_validate(result)
 
 
 @router.delete("/{session_id}", status_code=204, response_class=Response)

@@ -8,7 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.config import settings
+from app.config.settings import settings
+from app.db.session import SessionLocal
+from app.services.provider_runtime import (
+    RuntimeProvider,
+    ProviderRuntimeError,
+    resolve_assigned_provider,
+)
 
 logger = logging.getLogger(__name__)
 _REPORT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -59,8 +65,8 @@ def _result_from_state(state: dict[str, Any]) -> dict[str, Any]:
         "analysis_id": state.get("analysis_id"),
         "report_type": state.get("report_type"),
         "language": state.get("language"),
-        "provider": settings.REPORT_LLM_PROVIDER,
-        "model": _resolved_model_or_none(),
+        "provider": state.get("provider_id") or "unconfigured",
+        "model": state.get("model_identifier"),
         "validation_status": state.get("validation_status", "not_run"),
         "validation_errors": state.get("validation_errors", []),
         "revision_count": int(state.get("revision_count", 0)),
@@ -73,13 +79,25 @@ def _result_from_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolved_model_or_none() -> str | None:
+def _resolve_report_provider(
+    *, session_id: str | None, expected_user_id: str | None, run_id: str | None,
+) -> RuntimeProvider:
+    if not session_id or not expected_user_id:
+        raise ProviderRuntimeError(
+            "A verified session owner is required to generate an AI report.",
+            code="provider_owner_required",
+        )
+    db = SessionLocal()
     try:
-        from app.agents.report_agent.agent import resolve_report_model
-
-        return resolve_report_model()
-    except Exception:
-        return None
+        return resolve_assigned_provider(
+            db,
+            session_id=session_id,
+            expected_user_id=expected_user_id,
+            agent_role="report_agent",
+            run_id=run_id,
+        )
+    finally:
+        db.close()
 
 
 def _compact_analysis_inputs(
@@ -122,6 +140,7 @@ def _compact_analysis_inputs(
             "best_model_name", "best_score", "selection_metric", "cv_selection_score",
             "metric", "metric_names", "results", "evaluation", "final_test_metrics",
             "preprocessing_operations", "tuning_params",
+            "feature_selection",
         )
     }
     compact_operations = []
@@ -167,6 +186,9 @@ def generate_report(
     figures: dict[str, Any] | None = None,
     experiment: dict[str, Any] | None = None,
     model_registry: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    expected_user_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate a report without allowing report failures to escape into ML status."""
     identifier = report_id or task_id or ""
@@ -241,6 +263,33 @@ def generate_report(
                 "message": message,
             }
 
+    runtime_provider = None
+    try:
+        runtime_provider = _resolve_report_provider(
+            session_id=session_id,
+            expected_user_id=expected_user_id,
+            run_id=run_id,
+        )
+    except ProviderRuntimeError as exc:
+        metadata_file = _save_failure_metadata(
+            report_id=identifier,
+            analysis_id=analysis_identifier,
+            report_type=report_type,
+            language=language,
+            code=f"report_{exc.code}",
+            message=str(exc),
+            provider="unconfigured",
+            model=None,
+        )
+        return {
+            "status": "failed", "report_id": identifier,
+            "analysis_id": analysis_identifier, "report_type": report_type,
+            "language": language, "provider": "unconfigured", "model": None,
+            "validation_status": "not_run", "pdf_status": "not_run",
+            "html_path": None, "pdf_path": None, "metadata_path": metadata_file,
+            "error_code": f"report_{exc.code}", "message": str(exc),
+        }
+
     try:
         from app.agents.report_agent.graph import build_report_graph
         from app.agents.report_agent.html_renderer import stage_figures
@@ -253,6 +302,8 @@ def generate_report(
             "analysis_id": analysis_identifier,
             "report_type": report_type,
             "language": language,
+            "provider_id": runtime_provider.provider_id,
+            "model_identifier": runtime_provider.model_identifier,
             "input_facts": _compact_analysis_inputs(
                 data=data,
                 eda=eda,
@@ -268,7 +319,11 @@ def generate_report(
             "revision_count": 0,
             "status": "pending",
         }
-        state = build_report_graph().invoke(initial_state, {"recursion_limit": 20})
+        graph = build_report_graph(runtime_provider)
+        try:
+            state = graph.invoke(initial_state, {"recursion_limit": 20})
+        finally:
+            del graph
         result = _result_from_state(state)
         if not result.get("metadata_path"):
             result["metadata_path"] = _save_failure_metadata(
@@ -278,14 +333,14 @@ def generate_report(
                 language=language,
                 code=result.get("error_code") or "report_metadata_missing",
                 message=result.get("message") or "Report metadata could not be saved.",
-                provider=settings.REPORT_LLM_PROVIDER,
+                provider=runtime_provider.provider_id,
                 model=result.get("model"),
             )
         return result
     except Exception as exc:
         logger.warning("Report Agent failed (error_type=%s)", type(exc).__name__)
         message = "Report Agent generation failed. The completed analysis results remain available."
-        model = _resolved_model_or_none()
+        model = runtime_provider.model_identifier
         metadata_file = _save_failure_metadata(
             report_id=identifier,
             analysis_id=analysis_identifier,
@@ -293,13 +348,13 @@ def generate_report(
             language=language,
             code="report_agent_failed",
             message=message,
-            provider=settings.REPORT_LLM_PROVIDER,
+            provider=runtime_provider.provider_id,
             model=model,
         )
         return {
             "status": "failed", "report_id": identifier,
             "analysis_id": analysis_identifier, "report_type": report_type,
-            "language": language, "provider": settings.REPORT_LLM_PROVIDER,
+            "language": language, "provider": runtime_provider.provider_id,
             "model": model, "validation_status": "not_run", "pdf_status": "not_run",
             "html_path": None, "pdf_path": None, "metadata_path": metadata_file,
             "error_code": "report_agent_failed", "message": message,

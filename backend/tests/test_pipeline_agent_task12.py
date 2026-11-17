@@ -13,12 +13,12 @@ from pydantic import ValidationError
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-from backend.app.agents.ml_pipeline_agent import agent as agent_module
-from backend.app.agents.ml_pipeline_agent import executor
-from backend.app.agents.ml_pipeline_agent import llm as llm_module
-from backend.app.agents.ml_pipeline_agent import memory
-from backend.app.agents.ml_pipeline_agent.planning import prepare_request_plan
-from backend.app.agents.ml_pipeline_agent.tools import (
+from app.agents.pipeline_agent import agent as agent_module
+from app.agents.pipeline_agent import executor
+from app.agents.pipeline_agent import llm as llm_module
+from app.agents.pipeline_agent import memory
+from app.agents.pipeline_agent.planning import prepare_request_plan
+from app.agents.pipeline_agent.tools import (
     TOOL_SCHEMAS,
     ToolValidationError,
     UnknownToolError,
@@ -26,7 +26,7 @@ from backend.app.agents.ml_pipeline_agent.tools import (
     validate_tool_arguments,
     validate_tool_registry,
 )
-from app.config import settings
+from app.config.settings import settings
 from app.schemas.chat import ChatRequest
 
 
@@ -66,7 +66,7 @@ def _run_turn(
     queued_responses = list(responses)
     queued_results = list(execute_results or [])
 
-    async def fake_chat(*, messages, tools):
+    async def fake_chat(*, messages, tools, provider=None):
         captured_calls.append({"messages": messages, "tools": tools})
         return queued_responses.pop(0)
 
@@ -640,14 +640,15 @@ def test_local_ollama_tool_calling_capability_check_does_not_download():
 
 
 def test_unsupported_ollama_model_fails_before_provider_call(monkeypatch):
-    monkeypatch.setattr(settings, "LLM_PROVIDER", "ollama")
-    monkeypatch.setattr(settings, "LLM_MODEL", "unknown-model:latest")
-    completion = Mock()
-    monkeypatch.setattr(llm_module, "acompletion", completion)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "developer-key-must-not-be-used")
 
-    with pytest.raises(llm_module.AgentConfigurationError, match="native tool support"):
-        asyncio.run(llm_module.chat(messages=[{"role": "user", "content": "Inspect"}], tools=[{}]))
-    completion.assert_not_called()
+    async def missing_provider():
+        return await llm_module.chat(
+            messages=[{"role": "user", "content": "Inspect"}], tools=[{}], provider=None,
+        )
+
+    with pytest.raises(llm_module.AgentConfigurationError, match="AI Provider Settings"):
+        missing_provider().send(None)
 
 
 def test_history_drops_incomplete_tool_exchanges_and_keeps_order(monkeypatch):

@@ -1,6 +1,7 @@
 """Focused tests for AnalysisRun-aware model registry persistence."""
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,7 +9,7 @@ import pandas as pd
 import pytest
 from sklearn.preprocessing import LabelEncoder
 
-from backend.app.agents.ml_pipeline_agent import executor
+from app.agents.pipeline_agent import executor
 
 
 def _training_result() -> dict:
@@ -132,6 +133,63 @@ def test_training_registers_against_actual_run_and_session(monkeypatch, tmp_path
     assert saved_bundle["input_columns"] == ["feature"]
     assert model_version_call["artifact_uri"] == str(saved_path)
     db.commit.assert_called_once_with()
+
+
+def test_feature_selection_configuration_and_results_are_persisted(monkeypatch, tmp_path):
+    run = SimpleNamespace(id="run-feature-selection", session_id="session-1")
+    db, session = _patch_training(monkeypatch, tmp_path, run=run)
+    db.training_result["feature_selection"] = {
+        "enabled": True,
+        "method": "mutual_information",
+        "configuration": {"top_k": 1, "min_features": 1},
+        "fit_partition": "training_partition_excluding_holdout",
+        "fit_rows": 40,
+        "original_source_features": 1,
+        "input_features": 1,
+        "retained_features": 1,
+        "selected_feature_names": ["num__feature"],
+        "selected_features": [{
+            "name": "num__feature", "source_feature": "feature", "score": 0.8, "rank": 1,
+        }],
+        "excluded_features": [],
+        "cross_validation_folds": [],
+    }
+    captured_training = {}
+    monkeypatch.setattr(
+        executor.trainer_mod,
+        "train_and_evaluate",
+        lambda *_args, **kwargs: captured_training.update(kwargs) or db.training_result,
+    )
+    model_version_call = {}
+    monkeypatch.setattr(
+        executor, "create_experiment",
+        lambda *_args, **kwargs: SimpleNamespace(id="experiment-feature-selection"),
+    )
+    monkeypatch.setattr(
+        executor, "create_model_version",
+        lambda _db, **kwargs: model_version_call.update(kwargs) or SimpleNamespace(id="version-1"),
+    )
+
+    result = executor._tool_train_models(
+        session.id,
+        {
+            "task_type": "classification",
+            "feature_selection": {"method": "mutual_information", "top_k": 1},
+        },
+        db,
+        run_id=run.id,
+    )
+
+    assert captured_training["feature_selection_config"] == {
+        "method": "mutual_information", "top_k": 1, "min_features": 1,
+    }
+    assert result["feature_selection"]["selected_feature_names"] == ["num__feature"]
+    assert model_version_call["metrics_json"]["feature_selection"] == result["feature_selection"]
+    bundle = next(value for value, path in db.saved_artifacts if str(path).endswith("best_model.pkl"))
+    assert bundle["artifact_format_version"] == 1
+    assert bundle["feature_selection"] == result["feature_selection"]
+    saved_results = json.loads((tmp_path / "training_results.json").read_text(encoding="utf-8"))
+    assert saved_results["feature_selection"]["method"] == "mutual_information"
 
 
 @pytest.mark.parametrize(

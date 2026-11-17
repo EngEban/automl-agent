@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import mimetypes
 import re
 from pathlib import Path
 
@@ -11,11 +10,20 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.api.deps import CurrentUser, DB
-from app.config import settings
+from app.config.settings import settings
 from app.db import crud
+from app.utils.artifact_paths import resolve_artifact_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_DATASET_MEDIA_TYPES = {
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+}
 
 
 def _owned_session(session_id: str, db: DB, current_user: CurrentUser):
@@ -30,22 +38,14 @@ def _owned_session(session_id: str, db: DB, current_user: CurrentUser):
 def _stored_file_path(raw_path: str, artifact_label: str) -> Path:
     """Validate that a stored artifact is a regular file under storage."""
     try:
-        storage_root = settings.STORAGE_DIR.resolve()
-        path = Path(raw_path).resolve()
-        path.relative_to(storage_root)
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Rejected invalid %s path: %s", artifact_label, raw_path)
-        raise HTTPException(
-            status_code=404,
-            detail=f"{artifact_label} file is not available",
-        ) from exc
-
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=f"{artifact_label} file is missing on disk",
+        return resolve_artifact_path(
+            raw_path,
+            artifact_label=artifact_label,
+            permitted_root=settings.STORAGE_DIR,
         )
-    return path
+    except HTTPException:
+        logger.warning("Rejected unavailable %s artifact", artifact_label)
+        raise
 
 
 def _latest_artifact_path(
@@ -79,7 +79,6 @@ class ArtifactOut(BaseModel):
     id: str
     session_id: str
     artifact_type: str
-    file_path: str
 
     model_config = {"from_attributes": True}
 
@@ -158,7 +157,8 @@ def download_dataset(
         original_filename,
         fallback=path.name or f"dataset_{session_id}.csv",
     )
-    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    extension = Path(filename).suffix.lower()
+    media_type = _DATASET_MEDIA_TYPES.get(extension, "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=filename)
 
 

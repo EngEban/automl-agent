@@ -44,7 +44,7 @@ def fail(stage: str, reason: str, code: int = 1) -> None:
 
 
 try:
-    from app.config import settings
+    from app.config.settings import settings
 except Exception as exc:
     fail("configuration", f"load_error_type={type(exc).__name__}")
 
@@ -131,7 +131,7 @@ else:
     report("model_query", f"pass configured_model_present=true available_count={len(available_names)}")
 
 try:
-    from backend.app.agents.ml_pipeline_agent import llm as llm_module
+    from app.agents.pipeline_agent import llm as llm_module
 except Exception as exc:
     fail("configuration", f"llm_import_error_type={type(exc).__name__}")
 
@@ -637,9 +637,9 @@ try:
     from sqlalchemy.orm import sessionmaker
     from sqlalchemy.pool import StaticPool
 
-    from backend.app.agents.ml_pipeline_agent import agent as agent_module
-    from backend.app.agents.ml_pipeline_agent import executor
-    from backend.app.agents.ml_pipeline_agent.planning import prepare_request_plan
+    from app.agents.pipeline_agent import agent as agent_module
+    from app.agents.pipeline_agent import executor
+    from app.agents.pipeline_agent.planning import prepare_request_plan
     from app.db.base import Base
     from app.db.models import Session as UserSession, User
 

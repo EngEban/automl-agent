@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     )
 
     # ---------- Paths ----------
-    BASE_DIR: Path = Path(__file__).resolve().parent.parent
+    BASE_DIR: Path = Path(__file__).resolve().parents[2]
     STORAGE_DIR: Path = BASE_DIR / "storage"
     UPLOAD_DIR: Path = STORAGE_DIR / "uploads"
     REPORT_DIR: Path = STORAGE_DIR / "reports"
@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     REPORT_AGENT_ENABLED: bool = False
     REPORT_LLM_MAX_TOKENS: int = Field(default=4096, gt=0, le=16_000)
     REPORT_LLM_TIMEOUT_SECONDS: int = Field(default=90, gt=0, le=600)
+
+    # ---------- User-managed AI providers ----------
+    PROVIDER_CREDENTIAL_ENCRYPTION_KEY: str | None = None
+    PROVIDER_TEST_TIMEOUT_SECONDS: int = Field(default=15, gt=0, le=60)
 
     # ---------- Data limits ----------
     MAX_FILE_SIZE_MB: int = 200

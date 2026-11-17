@@ -8,7 +8,7 @@ from app.db.crud import get_user_by_email, create_user
 from app.db.models import User
 from app.schemas.user import UserCreate, UserLogin, UserRead, Token, GoogleAuthRequest
 from app.services import auth_service, notification_service
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

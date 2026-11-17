@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Index, String, Text, func,
+    JSON, Boolean, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint,
+    Index, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -229,3 +230,91 @@ class DatasetSource(Base):
     download_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     session: Mapped["Session"] = relationship("Session")
+
+
+def _unknown_provider_capabilities() -> dict[str, str]:
+    return {
+        "chat_completion": "unknown",
+        "tool_calling": "unknown",
+        "structured_output": "unknown",
+        "json_schema": "unknown",
+        "streaming": "unknown",
+    }
+
+
+class AIProviderProfile(Base):
+    __tablename__ = "ai_provider_profiles"
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_ai_provider_profiles_id_user"),
+        Index("ix_ai_provider_profiles_user_updated", "user_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_identifier: Mapped[str] = mapped_column(String(255), nullable=False)
+    endpoint_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    configuration_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    credential_ciphertext: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    credential_key_version: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    capability_status_json: Mapped[dict] = mapped_column(
+        JSON, default=_unknown_provider_capabilities, nullable=False,
+    )
+    connection_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    connection_error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_connection_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False,
+    )
+
+    @property
+    def credential_configured(self) -> bool:
+        return bool(self.credential_ciphertext and self.credential_key_version)
+
+    def __repr__(self) -> str:
+        return f"<AIProviderProfile id={self.id!r} provider={self.provider_id!r}>"
+
+
+class UserAgentProviderAssignment(Base):
+    __tablename__ = "user_agent_provider_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "agent_role IN ('pipeline_agent', 'report_agent')",
+            name="ck_user_agent_provider_assignments_role",
+        ),
+        UniqueConstraint(
+            "user_id", "agent_role",
+            name="uq_user_agent_provider_assignments_user_role",
+        ),
+        ForeignKeyConstraint(
+            ["profile_id", "user_id"],
+            ["ai_provider_profiles.id", "ai_provider_profiles.user_id"],
+            name="fk_user_agent_provider_assignments_owned_profile",
+            ondelete="CASCADE",
+        ),
+        Index("ix_user_agent_provider_assignments_profile", "profile_id"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    profile_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+    agent_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False,
+    )

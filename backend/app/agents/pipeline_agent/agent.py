@@ -10,26 +10,28 @@ from typing import Any
 from sqlalchemy.orm import Session as DBSession
 from starlette.concurrency import run_in_threadpool
 
-from backend.app.agents.ml_pipeline_agent import executor
-from backend.app.agents.ml_pipeline_agent.llm import (
+from app.agents.pipeline_agent import executor
+from app.agents.pipeline_agent.llm import (
     AgentConfigurationError,
     MalformedAgentResponse,
     chat,
     extract_message,
 )
-from backend.app.agents.ml_pipeline_agent.memory import format_tool_result, load_history
-from backend.app.agents.ml_pipeline_agent.planning import RequestPlan, prepare_request_plan
-from backend.app.agents.ml_pipeline_agent.prompts import build_system_prompt
-from backend.app.agents.ml_pipeline_agent.tools import (
+from app.agents.pipeline_agent.memory import format_tool_result, load_history
+from app.agents.pipeline_agent.planning import RequestPlan, prepare_request_plan
+from app.agents.pipeline_agent.prompts import build_system_prompt
+from app.agents.pipeline_agent.tools import (
     ToolValidationError,
     UnknownToolError,
     get_tool_schemas,
     validate_tool_arguments,
 )
-from app.config import settings
+from app.config.settings import settings
+from app.schemas.feature_selection import FeatureSelectionConfig
 from app.db.crud import create_message, get_run, get_session
 from app.db.session import SessionLocal
 from app.services.run_service import emit_event, is_cancellation_requested
+from app.services.provider_runtime import RuntimeProvider
 
 logger = logging.getLogger(__name__)
 execute_tool = executor.execute_tool
@@ -107,7 +109,7 @@ def _validate_mode_options(mode: str, analysis_options: dict[str, Any] | None) -
         raise ValueError("Analysis options must be an object.")
     if mode != "advanced":
         raise ValueError("Analysis options are available only in Advanced Mode.")
-    unsupported = set(analysis_options) - {"target_column", "task_type"}
+    unsupported = set(analysis_options) - {"target_column", "task_type", "feature_selection"}
     if unsupported:
         raise ValueError(
             "Unsupported advanced option(s): " + ", ".join(sorted(unsupported)) + "."
@@ -118,10 +120,18 @@ def _validate_mode_options(mode: str, analysis_options: dict[str, Any] | None) -
         raise ValueError("Advanced target_column must be a non-empty string.")
     if task_type is not None and task_type not in {"classification", "regression"}:
         raise ValueError("Advanced task_type must be classification or regression.")
-    return {
+    validated = {
         key: value.strip() if isinstance(value, str) else value
         for key, value in analysis_options.items()
     }
+    if validated.get("feature_selection") is not None:
+        try:
+            validated["feature_selection"] = FeatureSelectionConfig.model_validate(
+                validated["feature_selection"]
+            ).model_dump(exclude_none=True)
+        except Exception as exc:
+            raise ValueError(f"Invalid feature-selection configuration: {exc}") from exc
+    return validated
 
 
 def _apply_trusted_options(
@@ -140,6 +150,10 @@ def _apply_trusted_options(
             result.pop("target_column", None)
         if options.get("task_type"):
             result["task_type"] = options["task_type"]
+        if options.get("feature_selection") is not None:
+            result["feature_selection"] = options["feature_selection"]
+        else:
+            result.pop("feature_selection", None)
     elif tool_name == "set_target_column" and options.get("target_column"):
         # An explicit target named in the current message takes precedence.
         result.setdefault("column", options["target_column"])
@@ -147,6 +161,10 @@ def _apply_trusted_options(
         if plan.target_column:
             result["target_column"] = plan.target_column
         result["task_type"] = options.get("task_type") or "auto"
+        if options.get("feature_selection") is not None:
+            result["feature_selection"] = options["feature_selection"]
+        else:
+            result.pop("feature_selection", None)
     return result
 
 
@@ -203,6 +221,7 @@ async def run_agent(
     mode: str = "simple",
     analysis_options: dict[str, Any] | None = None,
     user_id: str | None = None,
+    provider: RuntimeProvider | None = None,
 ) -> dict[str, Any]:
     """Run one bounded turn while keeping run and owner context server controlled."""
     options = _validate_mode_options(mode, analysis_options)
@@ -297,7 +316,7 @@ async def run_agent(
         _close_db_if_open(db)
         try:
             response = await asyncio.wait_for(
-                chat(messages=messages, tools=tools),
+                chat(messages=messages, tools=tools, provider=provider),
                 timeout=settings.AGENT_LLM_TIMEOUT_SECONDS,
             )
             model_message = extract_message(response)

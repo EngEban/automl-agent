@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import resend
-from app.config import settings
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 resend.api_key = settings.RESEND_API_KEY

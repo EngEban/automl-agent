@@ -25,6 +25,7 @@ def test_expected_api_routes_are_registered() -> None:
 
     assert {
         "/api/sessions",
+        "/api/sessions/{session_id}/feature-analysis",
         "/api/chat/{session_id}",
         "/api/runs/{run_id}",
         "/api/artifacts/{session_id}",

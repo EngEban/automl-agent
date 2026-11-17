@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from sqlalchemy.orm import Session as DBSession
 
-from app.config import settings
+from app.config.settings import settings
 from app.core.data_loader import describe, load_from_bytes, load_from_path, load_from_url
 from app.db.crud import create_session
 from app.db.models import Session as SessionModel
@@ -135,6 +135,32 @@ def _finish_create(
     )
     logger.info("Session created: %s by user %s (%d rows)", session_id, user_id, len(df))
     return obj
+
+
+def persist_legacy_analysis_dataset(
+    db: DBSession,
+    *,
+    session_id: str,
+    df: Any,
+) -> SessionModel:
+    """Populate the owned session created for a legacy analysis task."""
+    session = db.get(SessionModel, session_id)
+    if session is None:
+        raise ValueError("The analysis session is no longer available.")
+
+    session_dir = _session_dir(session_id)
+    df.to_pickle(session_dir / "raw.pkl")
+    metadata = describe(df)
+    prior_metadata = session.dataset_meta if isinstance(session.dataset_meta, dict) else {}
+    original_filename = prior_metadata.get("original_filename")
+    if original_filename:
+        metadata["original_filename"] = original_filename
+    metadata["sample_rows"] = _clean_json(df.head(5).to_dict(orient="records"))
+    session.dataset_meta = _clean_json(metadata)
+    session.status = "running"
+    db.commit()
+    db.refresh(session)
+    return session
 def create_session_from_kaggle(
     db: DBSession, *, user_id: str, name: str, kaggle_ref: str,
     target_column: str | None = None, notes: str | None = None,

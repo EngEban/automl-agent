@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.orm import Session as DBSession
 
-from app.config import settings
+from app.config.settings import settings
 from app.core import eda as eda_mod
 from app.core import preprocessing as prep_mod
 from app.core import trainer as trainer_mod
@@ -28,7 +28,7 @@ from app.core.model_selector import (
     is_categorical_target_schema,
     validate_target_column,
 )
-from backend.app.agents.ml_pipeline_agent.tools import ToolValidationError, validate_tool_arguments
+from app.agents.pipeline_agent.tools import ToolValidationError, validate_tool_arguments
 from app.agents.report_agent.service import generate_report_safely
 from app.db.crud import (
     create_artifact, create_operation, get_run, get_session, list_artifacts, list_operations,
@@ -38,6 +38,7 @@ from app.db.crud import (
 from app.db.session import SessionLocal
 from app.services.notification_service import send_completion_email
 from app.services.run_service import emit_event, is_cancellation_requested
+from app.services.provider_runtime import ProviderRuntimeError
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,10 @@ def _tool_train_models(
     run = _require_training_run(db, session_id, run_id)
     _check_run_cancellation(run_id)
 
+    feature_selection_config = trainer_mod.selector_config_dict(
+        args.get("feature_selection")
+    )
+
     session_dir = _session_dir(session_id)
     df = _load_raw(db, session_id)
     target = args.get("target_column") or session.target_column
@@ -378,6 +383,8 @@ def _tool_train_models(
             "target_is_categorical": target_is_categorical,
             "target_name": target,
         }
+        if feature_selection_config is not None:
+            training_kwargs["feature_selection_config"] = feature_selection_config
         if run_id is not None:
             training_kwargs["cancel_check"] = lambda: is_cancellation_requested(run_id)
             def progress_callback(event_type: str, details: dict[str, Any]) -> None:
@@ -431,8 +438,10 @@ def _tool_train_models(
     task_type = training.get("task_type", task_type)
     target_encoder = training.get("target_encoder")
     preprocessing_operations = training.get("preprocessing_operations", [])
+    feature_selection = training.get("feature_selection", {"enabled": False})
 
     state["preprocessing_operations"] = preprocessing_operations
+    state["feature_selection"] = feature_selection
     for operation in preprocessing_operations:
         create_operation(
             db,
@@ -519,6 +528,7 @@ def _tool_train_models(
             "target_encoder": target_encoder,
             "task_type": task_type,
             "input_columns": list(X.columns),
+            "feature_selection": feature_selection,
         },
         model_artifact_path,
     )
@@ -541,6 +551,7 @@ def _tool_train_models(
                 "memory_summary": memory_summary,
                 "failures": training.get("failures", []),
                 "loading_metadata": loading_metadata,
+                "feature_selection": feature_selection,
             },
             ensure_ascii=False,
             indent=2,
@@ -570,13 +581,18 @@ def _tool_train_models(
             "memory_summary": memory_summary,
             "failures": training.get("failures", []),
             "loading_metadata": loading_metadata,
+            "feature_selection": feature_selection,
         }
         experiment = create_experiment(
             db,
             run_id=run.id,
             session_id=session.id,
             name=f"Experiment_{training['best_model_name']}",
-            config_json={"target": target, "task_type": task_type},
+            config_json={
+                "target": target,
+                "task_type": task_type,
+                "feature_selection": feature_selection_config,
+            },
             commit=False,
         )
         create_model_version(
@@ -619,6 +635,7 @@ def _tool_train_models(
         "evaluation": training.get("evaluation"),
         "final_test_metrics": training.get("final_test_metrics"),
         "preprocessing_operations": preprocessing_operations,
+        "feature_selection": feature_selection,
         "memory_summary": memory_summary,
         "failures": training.get("failures", []),
         "loading_metadata": loading_metadata,
@@ -630,8 +647,22 @@ def _tool_generate_report(
     args: dict,
     db: DBSession,
     run_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
     _check_run_cancellation(run_id)
+    session = get_session(db, session_id)
+    if session is None or (user_id is not None and str(session.user_id) != str(user_id)):
+        raise PermissionError("Session is not available to its authenticated owner.")
+    owner_id = str(session.user_id)
+    if run_id:
+        run = get_run(db, run_id)
+        if (
+            run is None
+            or str(run.session_id) != str(session_id)
+            or str(run.requested_by) != owner_id
+            or (user_id is not None and str(run.requested_by) != str(user_id))
+        ):
+            raise PermissionError("Analysis run is not available to its session owner.")
     session_dir = _session_dir(session_id)
     state = _load_state(session_id)
     if not state.get("results"):
@@ -686,6 +717,7 @@ def _tool_generate_report(
         "failures": state.get("training_failures", []),
         "tuning_params": state.get("tuning_params", {}),
         "loading_metadata": state.get("loading_metadata", {}),
+        "feature_selection": state.get("feature_selection", {"enabled": False}),
     }
 
     try:
@@ -735,6 +767,9 @@ def _tool_generate_report(
         target_column=state.get("target_column", ""),
         experiment=experiment_info,
         model_registry=registry_info,
+        session_id=session_id,
+        expected_user_id=owner_id,
+        run_id=run_id,
     )
     report_artifact_exists = False
     for candidate in (report_result.get("pdf_path"), report_result.get("html_path")):
@@ -809,6 +844,7 @@ def _tool_generate_report(
             session_id=session_id, dataset_filename=dataset_filename,
             target_column=state.get("target_column", ""), task_type=state.get("task_type", "classification"),
             best_model_name=state.get("best_model", ""), tuning_params=state.get("tuning_params"),
+            feature_selection=state.get("feature_selection", {"enabled": False}),
         )
         create_artifact(db, session_id=session_id, artifact_type="notebook", file_path=str(notebook_path), meta={})
 
@@ -869,7 +905,10 @@ def _tool_propose_plan(
             "Regression requires a numeric target. Choose classification or select a numeric target."
         )
 
+    feature_selection = trainer_mod.selector_config_dict(args.get("feature_selection"))
     plan_data = {**args, "target_column": target, "task_type": task_type}
+    if feature_selection is not None:
+        plan_data["feature_selection"] = feature_selection
     plan = create_plan(db, run_id=run.id, plan_json=plan_data, approval_status="pending")
     emit_event(
         db,
@@ -885,6 +924,7 @@ def _tool_propose_plan(
         "plan_id": plan.id,
         "target_column": target,
         "task_type": task_type,
+        "feature_selection": feature_selection,
         "message": f"I have proposed a plan to predict '{target}' using {task_type}. Please approve it to continue."
     }
 
@@ -951,6 +991,7 @@ def _tool_rerun_pipeline(
     args: dict,
     db: DBSession,
     run_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
     _check_run_cancellation(run_id)
     requested_task_type = args.get("task_type")
@@ -969,6 +1010,10 @@ def _tool_rerun_pipeline(
         candidate_plan = get_latest_plan_for_run(db, plan_run.id)
         if candidate_plan is not None and candidate_plan.approval_status == "approved":
             approved_plan = candidate_plan.plan_json
+
+    feature_selection_for_rerun = args.get("feature_selection")
+    if feature_selection_for_rerun is None:
+        feature_selection_for_rerun = (approved_plan or {}).get("feature_selection")
 
     if args.get("target_column") is not None:
         target_override = args["target_column"]
@@ -1064,15 +1109,18 @@ def _tool_rerun_pipeline(
             message="Preprocessing completed.",
         )
     _check_run_cancellation(run_id)
+    training_arguments = {
+        "task_type": (
+            requested_task_type
+            if requested_task_type in {"classification", "regression"}
+            else (approved_plan or {}).get("task_type", "auto")
+        ),
+    }
+    if feature_selection_for_rerun is not None:
+        training_arguments["feature_selection"] = feature_selection_for_rerun
     train_result = _tool_train_models(
         session_id,
-        {
-            "task_type": (
-                requested_task_type
-                if requested_task_type in {"classification", "regression"}
-                else (approved_plan or {}).get("task_type", "auto")
-            )
-        },
+        training_arguments,
         db,
         run_id=run_id,
     )
@@ -1088,6 +1136,7 @@ def _tool_rerun_pipeline(
         },
         db,
         run_id=run_id,
+        user_id=user_id,
     )
     state = _load_state(session_id)
     state["report_status"] = report_result.get("status", "failed")
@@ -1168,7 +1217,12 @@ def execute_tool(
         if tool_name in {"train_models", "rerun_pipeline", "propose_plan", "generate_report"}:
             if tool_name == "train_models":
                 arguments = dict(arguments)
-            result = function(session_id, arguments, db, run_id=run_id)
+            if tool_name in {"rerun_pipeline", "generate_report"}:
+                result = function(
+                    session_id, arguments, db, run_id=run_id, user_id=user_id,
+                )
+            else:
+                result = function(session_id, arguments, db, run_id=run_id)
         else:
             result = function(session_id, arguments, db)
         if not isinstance(result, dict):
@@ -1191,6 +1245,8 @@ def execute_tool(
         elif isinstance(exc, (ValueError, TypeError)):
             message = str(exc)
         elif isinstance(exc, ModelRegistryPersistenceError):
+            message = str(exc)
+        elif isinstance(exc, ProviderRuntimeError):
             message = str(exc)
         else:
             message = "The backend operation failed unexpectedly. Check the run status and server logs."

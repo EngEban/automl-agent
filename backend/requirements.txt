@@ -41,8 +41,7 @@ requests==2.32.3
 openpyxl==3.1.5
 xlrd==2.0.1
 
-# Tests
-pytest==8.3.2
+# OAuth token exchange uses httpx at runtime.
 httpx==0.28.1
 
 # Auth & Security

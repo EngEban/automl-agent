@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.orm import Session as DBSession
 
-from app.config import settings
+from app.config.settings import settings
 from app.db.crud import get_model_version
 from app.schemas.predict import PredictResponse
 

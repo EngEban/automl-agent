@@ -26,7 +26,7 @@ from pypdf import PdfReader
 from app.agents.report_agent.agent import ReportAgentConfigurationError, resolve_report_model
 from app.agents.report_agent.schemas import REPORT_SECTIONS
 from app.agents.report_agent.service import generate_report
-from app.config import settings
+from app.config.settings import settings
 
 
 class _HeadingParser(HTMLParser):

@@ -19,6 +19,8 @@ AutoML Agent is a session-based data analysis backend. It profiles datasets, pre
 - PDF and notebook artifacts: Jinja2 and Playwright for PDF rendering; the core code generator creates notebook source.
 - Authentication and notifications: JWT, Google OAuth code exchange, Passlib, Python-Jose, and Resend.
 
+The backend uses the canonical `app.*` Python namespace. Configuration is in `app.config.settings`, the Pipeline Agent is in `app.agents.pipeline_agent`, and the Celery entry point is `app.worker.worker:celery_app`.
+
 The frontend foundation and design-system preview are in [frontend](frontend/README.md). Full product pages are planned for later tasks. See [Architecture](docs/ARCHITECTURE.md), [API reference](docs/API.md), [Agent workflows](docs/AGENT.md), and [Setup](docs/SETUP.md).
 
 ## Docker Compose
@@ -46,11 +48,13 @@ Configure PostgreSQL and Redis URLs, CORS, and the separate Pipeline and Report 
     cd backend
     python -m venv .venv
     .\.venv\Scripts\Activate.ps1
-    python -m pip install -r requirements.txt
+    python -m pip install -r requirements-dev.txt
     cd ..
     alembic -c backend/alembic.ini upgrade head
     uvicorn app.main:app --app-dir backend --reload --port 8100
 
 The API is available at http://localhost:8100/docs. Local runtime requires PostgreSQL and Redis. The automated test suite does not require live LLM endpoints.
+
+Production/runtime deployments install `requirements.txt`; local development and testing use `requirements-dev.txt`, which includes the runtime pins. Backend and Compose values belong in the repository-root `.env` (create it from `.env.example` only when absent). The frontend reads only `NEXT_PUBLIC_API_BASE_URL` from `frontend/.env.local`, documented by `frontend/.env.example`.
 
 For tests, checks, and migration adoption safety, follow [Setup](docs/SETUP.md).

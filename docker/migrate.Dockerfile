@@ -14,5 +14,5 @@ RUN pip install --upgrade pip \
 COPY backend/alembic.ini ./alembic.ini
 COPY backend/alembic/ ./alembic/
 COPY backend/app/__init__.py ./app/__init__.py
-COPY backend/app/config.py ./app/config.py
+COPY backend/app/config/ ./app/config/
 COPY backend/app/db/ ./app/db/
